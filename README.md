@@ -1,82 +1,84 @@
 # MineDock
 
-> Local-first Minecraft Java Edition world library and one-click server manager.
+> A Windows-first, local-first library for Minecraft Java Edition worlds.
 
-MineDock is a desktop application for creating, starting, stopping, backing up, and organizing Minecraft worlds without making users manually maintain server folders or Docker containers.
+MineDock presents durable Worlds rather than server folders. A server process is an implementation detail attached to a world through a server profile; Docker is not required.
 
-The product model is **World Library first, Server Manager second**:
+## Current status
 
-- each world is a durable library item;
-- server runtime/configuration is attached to the world through a server profile;
-- common play styles are expressed as reusable templates;
-- starting a world should be close to one click;
-- advanced Minecraft/server concepts stay available, but are hidden from the default flow.
+Phases 0–5 of the implementation plan now provide the application shell and the core/runtime foundations:
 
-## Current direction
+- a runnable GPUI 0.2.2 desktop application;
+- a dark World Library with a metadata-only create-world wizard;
+- embedded, strictly parsed Survival, Hardcore, and Creative YAML templates;
+- schema-versioned, atomically written local metadata;
+- explicit world lifecycle states and startup recovery for stale active states;
+- background Java discovery and version parsing;
+- an authoritative Vanilla release/JAR provider with bounded HTTPS redirects, hash/size validation, and a versioned cache;
+- a persisted explicit-EULA-acceptance gate, deterministic `server.properties`, and `online-mode=true` launch validation;
+- a shell-free native Java process adapter with graceful `stop`, bounded escalation, log events, per-world start reservations, and Windows Job Object containment.
 
-- Desktop UI: **GPUI**
-- Language: **Rust**
-- Architecture: **Rust core independent from GPUI**
-- Initial platform: **Windows 11**
-- Initial Minecraft target: **Java Edition**
-- Initial runtimes: **Vanilla only**
-- Process model: **launch Java directly; Docker is not required**
-- Storage: **local-first**
-- Networking in MVP: **LAN + direct/manual exposure**
-- Cloud/remote management: **post-MVP**
+The current visible workflow stops after creating and listing metadata-only worlds. World cards show persisted lifecycle state and Java readiness, but **Start/Stop is disabled** until the Phase 6 UI connects authoritative version resolution, the EULA confirmation dialog, provisioning, and lifecycle commands. No real Minecraft JAR download or server launch is performed merely by opening the app or creating a world. Backup and networking UX are also not implemented yet.
 
-Hardcore is **not a special product mode**. It is one built-in world template.
+The target MVP remains the end-to-end scenario in [docs/MVP.md](docs/MVP.md); checklist status is tracked in [PLAN.md](PLAN.md).
+
+## Run from source
+
+Prerequisites on Windows 11:
+
+- stable Rust with `rustfmt` and `clippy`;
+- Visual Studio 2022 Build Tools with the Desktop development with C++ workload and a Windows SDK.
+
+From the repository root:
+
+```powershell
+cargo run -p minedock-app --locked
+```
+
+MineDock stores metadata under `%LOCALAPPDATA%\MineDock` by default. For an isolated development directory:
+
+```powershell
+$env:MINEDOCK_DATA_DIR = "$PWD\.local-minedock-data"
+cargo run -p minedock-app --locked
+```
+
+The override contains user/runtime state and must not be committed.
+
+## Validate
+
+```powershell
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build -p minedock-app --locked
+```
+
+Tests cover template validation, metadata round trips and corruption, world state transitions, Java output parsing, provider/EULA/provision invariants, lifecycle supervision, and controlled native-process behavior. Real Mojang downloads and a real Minecraft server process are intentionally outside the offline test suite.
 
 ## Repository layout
 
 ```text
 MineDock/
-├─ AGENTS.md
-├─ CODEX_PROMPT.md
-├─ README.md
-├─ SPEC.md
+├─ crates/
+│  ├─ minedock-core/   # domain, persistence, templates, providers, lifecycle rules
+│  └─ minedock-app/    # GPUI plus native/Windows adapters
+├─ templates/          # built-in declarative world templates
+├─ docs/               # MVP, UI, security, research notes, and ADRs
 ├─ ARCHITECTURE.md
 ├─ PLAN.md
-├─ Cargo.toml
-├─ rust-toolchain.toml
-├─ crates/
-│  ├─ minedock-core/
-│  └─ minedock-app/
-├─ docs/
-│  ├─ ADR-001-local-first.md
-│  ├─ ADR-002-world-server-separation.md
-│  ├─ MVP.md
-│  ├─ UI.md
-│  └─ SECURITY.md
-└─ templates/
-   ├─ vanilla-survival.yml
-   ├─ hardcore.yml
-   └─ creative.yml
+└─ SPEC.md
 ```
 
-## First implementation target
+`minedock-core` contains no GPUI or Windows types. Native Java probing, HTTPS transport, process creation, Job Objects, app-data locking, and GPUI presentation stay in `minedock-app`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the implemented boundaries.
 
-The first useful milestone is:
+## Safety constraints
 
-1. launch the GPUI shell;
-2. load built-in YAML templates;
-3. create a world record from a template;
-4. persist the MineDock metadata;
-5. launch a local Vanilla server process for that world;
-6. stream logs into the UI;
-7. stop gracefully using `stop`;
-8. make a backup after shutdown.
+- MineDock never silently accepts the Minecraft EULA. Provisioning requires a separately persisted record of explicit user acceptance before it can acquire a server artifact or write `eula.txt`.
+- Generated and launch-validated server configuration keeps `online-mode=true`.
+- Templates cannot provide executable paths, scripts, or download URLs.
+- Only allowlisted authoritative Mojang/Minecraft HTTPS authorities are accepted by the Vanilla provider.
+- Minecraft server JARs, worlds, Java runtimes, logs, backups, secrets, and local app data must not be committed.
+- The MVP does not require Docker, does not configure UPnP, and does not include mods, plugins, cloud features, or account login.
 
-See `CODEX_PROMPT.md` and `PLAN.md`.
-
-## Important constraints
-
-- Never commit Minecraft server JARs, worlds, Java runtimes, secrets, or user backups.
-- Do not silently accept Minecraft's EULA on behalf of a user. MineDock should present an explicit first-run acceptance flow before downloading/running server software.
-- Keep Minecraft runtime/download logic behind provider traits so Vanilla/Paper/Fabric support can be added later.
-- Avoid coupling domain state to GPUI entities.
-- GPUI is pre-1.0 and may introduce breaking changes. Keep UI-specific code isolated in `minedock-app`.
-
-## Status
-
-This archive is an implementation starter for Codex. The UI and process manager are intentionally thin: architecture, invariants, domain types, templates, and work order are defined so the implementation can proceed without redesigning the project first.
+Hardcore is a built-in template, not a special architectural mode.

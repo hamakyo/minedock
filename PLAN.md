@@ -1,15 +1,17 @@
 # MineDock Implementation Plan
 
+Checklist status reflects code and tests in the repository, not the final MVP acceptance scenario. Phases 0–5 have implementation foundations, but the user-facing start flow is still blocked on Phase 6 wiring. In particular, explicit EULA acceptance exists as a guarded core API and persisted record; its required GPUI confirmation flow remains open.
+
 ## Phase 0 — Stabilize scaffold
 
 Goal: a clean workspace that Codex can iterate on.
 
-- [ ] Confirm current stable Rust.
-- [ ] Confirm current official GPUI + `gpui_platform` dependency/API.
-- [ ] Pin a working lockfile.
-- [ ] `cargo fmt --all`.
-- [ ] `cargo check --workspace`.
-- [ ] Keep all GPUI-specific changes inside `minedock-app`.
+- [x] Confirm current stable Rust.
+- [x] Confirm and pin the official GPUI dependency/API (`gpui` 0.2.2 includes its platform backend).
+- [x] Pin a working lockfile.
+- [x] `cargo fmt --all`.
+- [x] `cargo check --workspace`.
+- [x] Keep all GPUI-specific changes inside `minedock-app`.
 
 Exit:
 - GPUI window opens.
@@ -17,34 +19,34 @@ Exit:
 
 ## Phase 1 — Domain + persistence
 
-- [ ] Finalize `WorldId`, `World`, `ServerProfile`, `WorldStatus`.
-- [ ] Add schema-versioned app metadata.
-- [ ] Implement app-data directory resolution.
-- [ ] Implement atomic JSON persistence.
-- [ ] Add repository/service interfaces.
-- [ ] Test round-trip persistence.
-- [ ] Test invalid/corrupt metadata failure behavior.
+- [x] Finalize `WorldId`, `World`, `ServerProfile`, `WorldStatus`.
+- [x] Add schema-versioned app metadata.
+- [x] Implement app-data directory resolution.
+- [x] Implement atomic JSON persistence.
+- [x] Add repository/service interfaces.
+- [x] Test round-trip persistence.
+- [x] Test invalid/corrupt metadata failure behavior.
 
 Exit:
 - MineDock can create/list metadata-only worlds across app restarts.
 
 ## Phase 2 — Template engine
 
-- [ ] Parse built-in YAML.
-- [ ] Validate template IDs.
-- [ ] Validate enum/property values.
-- [ ] Prevent executable/script/download fields.
-- [ ] Generate `ServerProfile` and world settings from template.
-- [ ] Create world wizard UI.
+- [x] Parse built-in YAML.
+- [x] Validate template IDs.
+- [x] Validate enum/property values.
+- [x] Prevent executable/script/download fields.
+- [x] Generate `ServerProfile` and world settings from template.
+- [x] Create world wizard UI.
 
 Exit:
 - Survival, Hardcore, Creative can be selected and persisted.
 
 ## Phase 3 — Java runtime resolution
 
-- [ ] Detect usable Java.
-- [ ] Parse `java -version`.
-- [ ] Model required Java version from selected Minecraft server version.
+- [x] Detect usable Java.
+- [x] Parse `java -version`.
+- [x] Model required Java version from selected Minecraft server version.
 - [ ] Provide actionable failure UI.
 - [ ] Design bundled-runtime provider but do not overbuild it.
 
@@ -53,42 +55,42 @@ Exit:
 
 ## Phase 4 — Vanilla distribution provider
 
-- [ ] Resolve Minecraft versions from an authoritative Mojang/Minecraft source.
-- [ ] Resolve server JAR metadata.
-- [ ] Download into content-addressed/versioned cache.
-- [ ] Verify size/hash where authoritative metadata provides it.
-- [ ] Never use arbitrary URLs from templates.
+- [x] Resolve Minecraft versions from an authoritative Mojang/Minecraft source.
+- [x] Resolve server JAR metadata.
+- [x] Download into content-addressed/versioned cache.
+- [x] Verify size/hash where authoritative metadata provides it.
+- [x] Never use arbitrary URLs from templates.
 - [ ] Add explicit Minecraft EULA acknowledgement flow.
-- [ ] Generate `eula.txt` only after explicit acceptance.
-- [ ] Generate `server.properties`.
+- [x] Persist explicit acceptance and generate `eula.txt` only after that acceptance.
+- [x] Generate `server.properties`.
 
 Exit:
 - A world directory can be provisioned reproducibly.
 
 ## Phase 5 — Process lifecycle
 
-- [ ] Spawn Java with piped stdin/stdout/stderr.
-- [ ] Capture PID/handle.
-- [ ] Stream raw log lines.
-- [ ] Add state machine.
-- [ ] Detect process exit.
-- [ ] Implement graceful `stop`.
-- [ ] Implement stop timeout and explicit escalation.
-- [ ] Prevent concurrent starts of same world.
-- [ ] Recover stale "running" metadata after app crash.
+- [x] Spawn Java with piped stdin/stdout/stderr.
+- [x] Capture PID/handle.
+- [x] Stream raw log lines.
+- [x] Add state machine.
+- [x] Detect process exit.
+- [x] Implement graceful `stop`.
+- [x] Implement stop timeout and explicit escalation.
+- [x] Prevent concurrent starts of same world.
+- [x] Recover stale "running" metadata after app crash.
 
 Exit:
 - Vanilla world reliably starts/stops from core.
 
 ## Phase 6 — GPUI World Library
 
-- [ ] Render persisted world cards.
+- [x] Render persisted world cards.
 - [ ] Start / Stop actions.
-- [ ] Lifecycle indicators.
+- [x] Lifecycle indicators.
 - [ ] Player count if known.
 - [ ] World detail panel.
 - [ ] Recent logs.
-- [ ] Disable invalid actions according to state.
+- [x] Disable invalid actions according to state.
 
 Exit:
 - Main workflow is usable without terminal commands.
@@ -131,13 +133,13 @@ Exit:
 ## Phase 10 — MVP hardening
 
 - [ ] Crash recovery.
-- [ ] Corrupt metadata handling.
+- [x] Corrupt metadata handling.
 - [ ] Partial download recovery.
 - [ ] Disk space checks.
-- [ ] Process timeout tests.
+- [x] Process timeout tests.
 - [ ] Windows packaging.
 - [ ] Basic telemetry-free diagnostics bundle.
-- [ ] README user setup.
+- [x] README user setup.
 
 ## Post-MVP backlog
 

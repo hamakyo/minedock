@@ -37,7 +37,7 @@ Future clients should be possible without rewriting world lifecycle logic:
 - remote API
 - test harness
 
-## 3. Suggested modules
+## 3. Implemented modules
 
 ```text
 minedock-core/src/
@@ -50,16 +50,22 @@ minedock-core/src/
 ├─ minecraft/
 │  ├─ mod.rs
 │  ├─ properties.rs
-│  ├─ version.rs
-│  └─ vanilla.rs
-├─ process/
-│  ├─ mod.rs
-│  └─ events.rs
-└─ backup/
-   └─ mod.rs
+│  └─ provider.rs
+├─ process.rs
+└─ runtime.rs
+
+minedock-app/src/
+├─ main.rs
+├─ http_transport.rs
+├─ java_adapter.rs
+├─ lifecycle_adapter.rs
+├─ native_process.rs
+└─ native_safety.rs
 ```
 
-The starter currently keeps some of these concepts compact; Codex may split modules as implementation grows.
+`minedock-core` owns domain validation, templates, persistence contracts, Java requirements, Vanilla metadata/provisioning rules, launch specifications, and lifecycle supervision. It imports neither GPUI nor Windows APIs.
+
+`minedock-app` owns the GPUI projection and all native effects: Windows app-data resolution and leasing, Java probing, HTTPS I/O, native process creation, reparse-point checks, and Job Object containment. Backup modules have not been introduced yet.
 
 ## 4. World vs Server separation
 
@@ -119,9 +125,11 @@ DistributionProvider
 ProcessAdapter
 ```
 
-MVP:
-- `VanillaProvider`
-- `NativeJavaProcess`
+Implemented foundations:
+- `VanillaProvider<T, S>` in core, parameterized by transport and path-safety seams;
+- `UreqTransport` in the app for bounded, redirect-explicit HTTPS;
+- `NativeProcessFactory` / `NativeServerProcess` in the app;
+- `LifecycleSupervisor` in core, parameterized by process, persistence, and lease adapters.
 
 Later:
 - `PaperProvider`
@@ -130,18 +138,16 @@ Later:
 
 ## 7. Process event model
 
-Raw process output enters an adapter and emits events:
+Raw process output enters the native adapter and emits bounded events:
 
 ```text
 stdout/stderr
     │
     ├──────────────▶ RawLogLine
-    │
-    └─ parser ─────▶ PlayerJoined
-                     PlayerLeft
-                     PlayerDied
-                     ServerReady
+    └──────────────▶ reliable process lifecycle events
 ```
+
+Join/leave/death and server-ready parsing belongs to Phase 7 and is not implemented. Raw log text is never the authority for process exit or successful process control.
 
 Lifecycle authority:
 - OS process handle / exit status
@@ -150,31 +156,27 @@ Lifecycle authority:
 
 Do not make lifecycle correctness depend on fragile localized log text.
 
-## 8. UI state model
+## 8. Current UI composition
 
 GPUI stores view state but does not own business truth.
 
-Suggested:
-
 ```text
-AppState (GPUI entity)
-├─ selected_world
-├─ wizard state
-├─ transient dialogs
-└─ projection of CoreSnapshot
+MineDockView (GPUI entity)
+├─ WorldLibrary<JsonWorldRepository>
+├─ LifecycleSupervisor<app/native adapters>
+├─ built-in TemplateCatalog
+├─ create-world wizard state
+├─ startup error / Java readiness projection
+└─ AppDataLease for this process lifetime
 ```
 
-Core emits snapshots/events.
+At startup the app acquires an exclusive app-data lease, reconciles persisted active lifecycle states to `Failed`, loads the world library, and probes Java off the GPUI event loop. A lease or metadata failure disables mutating actions.
 
-UI requests commands:
-- `CreateWorld`
-- `StartWorld`
-- `StopWorld`
-- `CreateBackup`
+The UI currently issues only create-world commands. Start/Stop, explicit EULA acknowledgement, provisioning, log presentation, and backup commands remain Phase 6+ integration work even though their core/native foundations exist.
 
 ## 9. Persistence
 
-Use a schema-versioned JSON format initially.
+The current repository uses schema-versioned JSON and atomic replacement.
 
 Why JSON:
 - inspectable
@@ -193,6 +195,8 @@ Example:
 ```
 
 Use IDs rather than names as stable references.
+
+The app-data root is `%LOCALAPPDATA%\MineDock` on Windows, or the explicit `MINEDOCK_DATA_DIR` override. `minedock.json` stores metadata only; world content and server artifacts remain separate. Persisted world data paths are canonical relative paths rooted beneath app data.
 
 ## 10. Error model
 
@@ -222,8 +226,10 @@ Avoid Windows-only types in core.
 OS-specific concerns belong in adapters:
 - Java discovery
 - application data path
-- firewall diagnostics
-- process creation flags
+- app-data lifecycle lease
+- reparse-point/path checks
+- suspended process creation and Job Object assignment
+- firewall diagnostics (future)
 
 ## 12. Cloud boundary
 

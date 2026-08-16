@@ -1,5 +1,7 @@
 # MVP Definition
 
+> Implementation status: this file defines the target acceptance bar; it is not a claim that the MVP is complete. The current build supports the GPUI World Library, built-in template selection, metadata-only world creation/persistence, Java readiness reporting, and Phase 4–5 provider/process foundations. Start/Stop UI wiring, explicit EULA confirmation UI, real provisioning acceptance, logs/player UX, backups, LAN endpoint display, and packaging remain open. See [../PLAN.md](../PLAN.md) for the live checklist.
+
 ## Goal
 
 A Windows user can install MineDock, create one of three Vanilla Java Edition world types, start it locally, let friends on the LAN join, stop it safely, and receive an automatic local backup.
