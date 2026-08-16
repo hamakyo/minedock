@@ -1,0 +1,30 @@
+schema_version: 1
+id: hardcore
+name: Hardcore
+description: One-life survival for a small private group.
+
+minecraft:
+  edition: java
+  distribution: vanilla
+  version: current-release
+
+server:
+  max_players: 4
+  online_mode: true
+  whitelist: true
+  port: 25565
+  memory_min_mb: 1024
+  memory_max_mb: 4096
+
+world:
+  gamemode: survival
+  difficulty: hard
+  hardcore: true
+  seed: null
+  generate_structures: true
+  pvp: true
+
+backup:
+  enabled: true
+  on_shutdown: true
+  retain: 20

@@ -1,0 +1,23 @@
+/target
+Cargo.lock.bak
+
+# MineDock runtime/user data
+/MineDockData/
+/worlds/
+/backups/
+/downloads/
+/runtimes/
+
+# Minecraft artifacts/data
+**/server.jar
+**/eula.txt
+**/logs/
+**/world/
+**/world_nether/
+**/world_the_end/
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
