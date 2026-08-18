@@ -1,6 +1,19 @@
-# MineDock
+<h1 align="center">MineDock</h1>
 
-> A Windows-first, local-first library for Minecraft Java Edition worlds.
+<p align="center">
+  <strong>A Windows-first, local-first library for Minecraft Java Edition worlds.</strong>
+</p>
+
+<p align="center">
+  <img alt="Rust 1.85+" src="https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust&logoColor=white">
+  <img alt="GPUI 0.2.2" src="https://img.shields.io/badge/GPUI-0.2.2-5A67D8">
+  <img alt="Windows 11" src="https://img.shields.io/badge/Platform-Windows%2011-0078D4?logo=windows11&logoColor=white">
+  <img alt="Work in progress" src="https://img.shields.io/badge/Status-Work%20in%20progress-F2C94C">
+</p>
+
+<p align="center">
+  English | <a href="README.ja.md">日本語</a>
+</p>
 
 MineDock presents durable Worlds rather than server folders. A server process is an implementation detail attached to a world through a server profile; Docker is not required.
 
