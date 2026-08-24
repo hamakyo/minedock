@@ -1,7 +1,14 @@
 use std::{
+    collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Sender},
+    },
+    time::Duration,
 };
 
 use gpui::{
@@ -11,9 +18,10 @@ use gpui::{
     WindowBounds, WindowOptions, actions, div, fill, prelude::*, px, relative, rgb, rgba, size,
 };
 use minedock_core::{
-    CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository,
-    JsonWorldRepository, LifecycleSupervisor, OFFICIAL_EULA_URL, TemplateCatalog, TemplateId,
-    World, WorldId, WorldLibrary, WorldStatus, normalize_world_name,
+    CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository, JavaReadiness,
+    JavaRuntime, JsonWorldRepository, LaunchSpec, LifecycleSupervisor, MineDockError,
+    OFFICIAL_EULA_URL, SessionId, TemplateCatalog, TemplateId, World, WorldId, WorldLibrary,
+    WorldStatus, normalize_world_name,
 };
 
 #[allow(dead_code)]
@@ -22,6 +30,115 @@ mod java_adapter;
 mod lifecycle_adapter;
 mod native_process;
 mod native_safety;
+
+type AppLifecycle = LifecycleSupervisor<
+    lifecycle_adapter::JsonLifecyclePersistence,
+    native_process::NativeProcessFactory,
+    lifecycle_adapter::AppDataLeaseProvider,
+>;
+
+struct PreparedLaunch {
+    launch_spec: LaunchSpec,
+    java_status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartProgress {
+    Starting,
+}
+
+fn prepare_launch(
+    app_data_root: &Path,
+    world: &World,
+    eula: &FileEulaAcceptanceRepository,
+) -> minedock_core::Result<PreparedLaunch> {
+    let provider = http_transport::production_vanilla_provider(app_data_root.join("downloads"))?;
+    let resolved = provider.resolve_version(&world.server.version_selector()?)?;
+    let readiness = java_adapter::discover_java_off_event_loop(resolved.java_requirement)
+        .recv()
+        .map_err(|_| {
+            MineDockError::JavaUnavailable("Java readiness probe did not return a result".into())
+        })?;
+    let (runtime, java_status) = select_java_runtime(readiness)?;
+    let artifact = provider.acquire_server(&resolved, eula)?;
+    let provisioned =
+        provider.provision_server_at(app_data_root, world, &resolved, &artifact, eula)?;
+    let launch_spec = LaunchSpec::new(&runtime, &provisioned, &world.server, world.id)?;
+    Ok(PreparedLaunch {
+        launch_spec,
+        java_status,
+    })
+}
+
+fn select_java_runtime(readiness: JavaReadiness) -> minedock_core::Result<(JavaRuntime, String)> {
+    let java_status = readiness.status_text();
+    let runtime = readiness.runtime.ok_or_else(|| {
+        MineDockError::JavaUnavailable(format!(
+            "{java_status}. Choose a compatible Java executable and retry."
+        ))
+    })?;
+    Ok((runtime, java_status))
+}
+
+fn eula_requires_confirmation<E: EulaAcceptanceRepository>(
+    repository: &E,
+) -> minedock_core::Result<bool> {
+    Ok(!repository.is_accepted()?)
+}
+
+fn execute_start(
+    lifecycle: AppLifecycle,
+    app_data_root: PathBuf,
+    world: World,
+    eula: FileEulaAcceptanceRepository,
+    progress: Sender<StartProgress>,
+) -> (
+    AppLifecycle,
+    Option<String>,
+    minedock_core::Result<SessionId>,
+) {
+    let mut java_status = None;
+    let (lifecycle, result) = execute_lifecycle_start(lifecycle, &app_data_root, world.id, || {
+        let prepared = prepare_launch(&app_data_root, &world, &eula)?;
+        java_status = Some(prepared.java_status);
+        let _ = progress.send(StartProgress::Starting);
+        Ok(prepared.launch_spec)
+    });
+    (lifecycle, java_status, result)
+}
+
+fn start_allowed(
+    status: WorldStatus,
+    lifecycle_available: bool,
+    operation_active: bool,
+    session_active: bool,
+) -> bool {
+    lifecycle_available && !operation_active && !session_active && status == WorldStatus::Stopped
+}
+
+fn execute_lifecycle_start<P, F, L, Resolve>(
+    mut lifecycle: LifecycleSupervisor<P, F, L>,
+    app_data_root: &Path,
+    world_id: WorldId,
+    resolve_launch: Resolve,
+) -> (
+    LifecycleSupervisor<P, F, L>,
+    minedock_core::Result<SessionId>,
+)
+where
+    P: minedock_core::LifecyclePersistence,
+    F: minedock_core::ProcessFactory,
+    L: minedock_core::LifecycleLeaseProvider,
+    Resolve: FnOnce() -> minedock_core::Result<LaunchSpec>,
+{
+    let result = lifecycle.start_checked(
+        app_data_root,
+        world_id,
+        WorldStatus::Stopped,
+        resolve_launch,
+    );
+    (lifecycle, result)
+}
 
 actions!(
     text_input,
@@ -40,6 +157,7 @@ actions!(
         Copy,
         CreateWorldAction,
         CancelWizardAction,
+        CancelEulaAction,
     ]
 );
 
@@ -665,13 +783,7 @@ impl Focusable for TextInput {
 struct MineDockView {
     library: Option<WorldLibrary<JsonWorldRepository>>,
     _app_data_lease: Option<lifecycle_adapter::AppDataLease>,
-    _lifecycle: Option<
-        LifecycleSupervisor<
-            lifecycle_adapter::JsonLifecyclePersistence,
-            native_process::NativeProcessFactory,
-            lifecycle_adapter::AppDataLeaseProvider,
-        >,
-    >,
+    _lifecycle: Option<AppLifecycle>,
     catalog: Option<TemplateCatalog>,
     startup_error: Option<String>,
     name_input: Entity<TextInput>,
@@ -682,6 +794,9 @@ struct MineDockView {
     eula_open: bool,
     pending_start: Option<WorldId>,
     eula_error: Option<String>,
+    active_start: Option<WorldId>,
+    status_overrides: HashMap<WorldId, WorldStatus>,
+    start_error: Option<String>,
 }
 
 impl MineDockView {
@@ -704,6 +819,9 @@ impl MineDockView {
                     eula_open: false,
                     pending_start: None,
                     eula_error: None,
+                    active_start: None,
+                    status_overrides: HashMap::new(),
+                    start_error: None,
                 };
             }
         };
@@ -796,6 +914,9 @@ impl MineDockView {
             eula_open: false,
             pending_start: None,
             eula_error: None,
+            active_start: None,
+            status_overrides: HashMap::new(),
+            start_error: None,
         }
     }
 
@@ -812,6 +933,7 @@ impl MineDockView {
         self.pending_start = Some(world_id);
         self.eula_open = true;
         self.eula_error = None;
+        self.start_error = None;
         cx.notify();
     }
 
@@ -831,6 +953,13 @@ impl MineDockView {
         cx.notify();
     }
 
+    fn cancel_eula_action(&mut self, _: &CancelEulaAction, _: &mut Window, cx: &mut Context<Self>) {
+        self.eula_open = false;
+        self.pending_start = None;
+        self.eula_error = None;
+        cx.notify();
+    }
+
     fn accept_eula(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.eula_repository() else {
             self.eula_error = Some("MineDock's app-data directory is unavailable.".into());
@@ -841,8 +970,11 @@ impl MineDockView {
             Ok(Some(_)) => {
                 self.eula_open = false;
                 self.eula_error = None;
-                // Keep pending_start until the Start coordinator resumes it.
-                cx.notify();
+                if let Some(world_id) = self.pending_start.take() {
+                    self.begin_start(world_id, cx);
+                } else {
+                    cx.notify();
+                }
             }
             Ok(None) => {
                 self.eula_error = Some(
@@ -858,6 +990,169 @@ impl MineDockView {
                 cx.notify();
             }
         }
+    }
+
+    fn displayed_status(&self, world: &World) -> WorldStatus {
+        self.status_overrides
+            .get(&world.id)
+            .copied()
+            .unwrap_or(world.status)
+    }
+
+    fn can_start_world(&self, world_id: WorldId) -> bool {
+        let Some(world) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.get(world_id))
+        else {
+            return false;
+        };
+        let session_active = self
+            ._lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.session_id(world_id).is_some());
+        start_allowed(
+            world.status,
+            self.can_mutate() && self._lifecycle.is_some(),
+            self.active_start.is_some(),
+            session_active,
+        )
+    }
+
+    fn start_world(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_start_world(world_id) {
+            return;
+        }
+        let Some(repository) = self.eula_repository() else {
+            self.start_error = Some("MineDock's app-data directory is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        match eula_requires_confirmation(&repository) {
+            Ok(false) => self.begin_start(world_id, cx),
+            Ok(true) => self.request_eula_confirmation(world_id, cx),
+            Err(error) => {
+                self.start_error = Some(format!(
+                    "MineDock could not check Minecraft EULA acceptance: {error}"
+                ));
+                cx.notify();
+            }
+        }
+    }
+
+    fn begin_start(&mut self, world_id: WorldId, cx: &mut Context<Self>) {
+        if !self.can_start_world(world_id) {
+            self.start_error = Some(
+                "This world is no longer stopped or already has an active lifecycle operation."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(library) = self.library.as_ref() else {
+            self.start_error = Some("MineDock's world library is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(world) = library.get(world_id).cloned() else {
+            self.start_error = Some("The selected world no longer exists.".into());
+            cx.notify();
+            return;
+        };
+        let app_data_root = library.repository().root().to_path_buf();
+        let Some(eula) = self.eula_repository() else {
+            self.start_error = Some("MineDock's app-data directory is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(lifecycle) = self._lifecycle.take() else {
+            self.start_error = Some("The lifecycle runtime is unavailable.".into());
+            cx.notify();
+            return;
+        };
+
+        self.active_start = Some(world_id);
+        self.status_overrides
+            .insert(world_id, WorldStatus::Preparing);
+        self.start_error = None;
+        cx.notify();
+
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_by_worker = completed.clone();
+        let worker = cx.background_executor().spawn(async move {
+            let result = execute_start(lifecycle, app_data_root, world, eula, progress_sender);
+            completed_by_worker.store(true, Ordering::Release);
+            result
+        });
+
+        let progress_completed = completed.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let mut drained = false;
+                while let Ok(progress) = progress_receiver.try_recv() {
+                    drained = true;
+                    let _ = this.update(cx, |view, cx| {
+                        if view.active_start != Some(world_id) {
+                            return;
+                        }
+                        match progress {
+                            StartProgress::Starting => {
+                                view.status_overrides
+                                    .insert(world_id, WorldStatus::Starting);
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+                if progress_completed.load(Ordering::Acquire) && !drained {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, java_status, result) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                view.active_start = None;
+                view.status_overrides.remove(&world_id);
+                if let Some(java_status) = java_status {
+                    view.java_status = java_status;
+                }
+                match result {
+                    Ok(_) => {
+                        view.start_error = None;
+                    }
+                    Err(error) => {
+                        view.start_error = Some(format!("Could not start this world: {error}"));
+                    }
+                }
+                if let Some(library) = view.library.as_mut() {
+                    if let Err(error) = library.reload() {
+                        let refresh_error = format!(
+                            "MineDock could not refresh the persisted world state: {error}"
+                        );
+                        view.start_error = Some(match view.start_error.take() {
+                            Some(existing) => format!("{existing} {refresh_error}"),
+                            None => refresh_error,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_wizard(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1014,11 +1309,22 @@ impl MineDockView {
             )
     }
 
-    fn render_library(&mut self) -> impl IntoElement {
+    fn render_library(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut cards = div().flex().flex_col().gap(px(12.));
         if let Some(library) = &self.library {
-            for world in library.list() {
-                cards = cards.child(world_card(world));
+            let worlds: Vec<_> = library.list().to_vec();
+            for world in worlds {
+                let world_id = world.id;
+                let status = self.displayed_status(&world);
+                let start_enabled = self.can_start_world(world_id);
+                cards = cards.child(world_card(
+                    &world,
+                    status,
+                    start_enabled,
+                    cx.listener(move |view, event, window, cx| {
+                        view.start_world(world_id, event, window, cx)
+                    }),
+                ));
             }
         }
         if self
@@ -1144,6 +1450,8 @@ impl MineDockView {
             .absolute()
             .inset_0()
             .bg(rgba(0xCC0D1016))
+            .key_context("MineDockEula")
+            .on_action(cx.listener(Self::cancel_eula_action))
             .flex()
             .items_center()
             .justify_center()
@@ -1210,7 +1518,7 @@ impl Render for MineDockView {
             .gap(px(20.))
             .child(self.render_header(cx))
             .child(div().text_size(px(20.)).child("Worlds"))
-            .child(self.render_library());
+            .child(self.render_library(cx));
         if let Some(error) = &self.startup_error {
             content = content.child(
                 div()
@@ -1221,6 +1529,16 @@ impl Render for MineDockView {
                     .child(format!(
                         "Startup error — {error}. Mutating actions are disabled."
                     )),
+            );
+        }
+        if let Some(error) = &self.start_error {
+            content = content.child(
+                div()
+                    .p(px(12.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x42262B))
+                    .text_color(rgb(0xFFB4B4))
+                    .child(error.clone()),
             );
         }
         if self.wizard_open {
@@ -1261,14 +1579,47 @@ fn button(
     button
 }
 
-fn world_card(world: &World) -> impl IntoElement {
-    let (indicator, status_color) = match world.status {
+fn world_card(
+    world: &World,
+    status: WorldStatus,
+    start_enabled: bool,
+    start_handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let (indicator, status_color) = match status {
         WorldStatus::Stopped => ("○", rgb(0xA1A8B5)),
         WorldStatus::Running => ("●", rgb(0x7BE0A2)),
         WorldStatus::Failed => ("!", rgb(0xFF9B9B)),
         _ => ("◌", rgb(0xF0C674)),
     };
-    let status = format!("{indicator}  {:?}", world.status);
+    let status_text = format!("{indicator}  {status:?}");
+    let action_text = match status {
+        WorldStatus::Stopped => "START",
+        WorldStatus::Preparing => "PREPARING",
+        WorldStatus::Starting => "STARTING",
+        WorldStatus::Running => "RUNNING",
+        WorldStatus::Stopping => "STOPPING",
+        WorldStatus::BackingUp => "BACKING UP",
+        WorldStatus::Failed => "RECOVER REQUIRED",
+    };
+    let mut action = div()
+        .id(SharedString::from(format!("start-{}", world.id)))
+        .px(px(14.))
+        .py(px(8.))
+        .rounded(px(8.))
+        .bg(if start_enabled {
+            rgb(0x3D5A88)
+        } else {
+            rgb(0x292E38)
+        })
+        .text_color(if start_enabled {
+            rgb(0xF2F4F8)
+        } else {
+            rgb(0x777F8D)
+        })
+        .child(action_text);
+    if start_enabled {
+        action = action.focusable().on_click(start_handler);
+    }
     div()
         .w_full()
         .p(px(18.))
@@ -1288,22 +1639,14 @@ fn world_card(world: &World) -> impl IntoElement {
                         .text_color(rgb(0x9CA3AF))
                         .child(format!("Vanilla · {}", world.server.version)),
                 )
-                .child(div().text_color(status_color).child(status))
+                .child(div().text_color(status_color).child(status_text))
                 .child(
                     div()
                         .text_color(rgb(0x707987))
-                        .child("Runtime unavailable in this build · Start disabled"),
+                        .child("Vanilla release, Java, and server files are prepared on Start"),
                 ),
         )
-        .child(
-            div()
-                .px(px(14.))
-                .py(px(8.))
-                .rounded(px(8.))
-                .bg(rgb(0x292E38))
-                .text_color(rgb(0x777F8D))
-                .child("START (unavailable)"),
-        )
+        .child(action)
 }
 
 fn main() {
@@ -1323,6 +1666,7 @@ fn main() {
             KeyBinding::new("ctrl-x", Cut, Some("TextInput")),
             KeyBinding::new("enter", CreateWorldAction, Some("TextInput")),
             KeyBinding::new("escape", CancelWizardAction, Some("MineDockWizard")),
+            KeyBinding::new("escape", CancelEulaAction, Some("MineDockEula")),
         ]);
         let bounds = Bounds::centered(None, size(px(900.), px(650.)), cx);
         cx.open_window(
@@ -1344,9 +1688,122 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{EULA_ACCEPTANCE_FILE, eula_acceptance_path, utf16_range_to_byte_range};
-    use minedock_core::{EulaAcceptanceRepository, FileEulaAcceptanceRepository};
+    use super::{
+        EULA_ACCEPTANCE_FILE, eula_acceptance_path, eula_requires_confirmation,
+        execute_lifecycle_start, select_java_runtime, start_allowed, utf16_range_to_byte_range,
+    };
+    use minedock_core::{
+        EulaAcceptanceRepository, FileEulaAcceptanceRepository, GracefulStopResult,
+        InMemoryLifecyclePersistence, JavaMajor, JavaReadiness, JavaRequirement,
+        JavaUnavailableReason, LaunchSpec, LifecycleLeaseProvider, ProcessExit, ProcessFactory,
+        ServerEvent, ServerProcess, SessionId, StopEscalationToken, ValidatedServerCommand,
+        WorldId, WorldStatus,
+    };
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    #[derive(Debug, Default)]
+    struct TestLease;
+
+    #[derive(Debug, Default)]
+    struct TestLeaseProvider;
+
+    impl LifecycleLeaseProvider for TestLeaseProvider {
+        type Lease = TestLease;
+
+        fn acquire(&mut self, _: &Path) -> minedock_core::Result<Self::Lease> {
+            Ok(TestLease)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestProcess {
+        world_id: WorldId,
+        session_id: SessionId,
+    }
+
+    impl ServerProcess for TestProcess {
+        fn world_id(&self) -> WorldId {
+            self.world_id
+        }
+
+        fn session_id(&self) -> SessionId {
+            self.session_id
+        }
+
+        fn pid(&self) -> u32 {
+            42
+        }
+
+        fn send_command(&mut self, _: &ValidatedServerCommand) -> minedock_core::Result<()> {
+            Ok(())
+        }
+
+        fn graceful_stop(
+            &mut self,
+            _: std::time::Duration,
+        ) -> minedock_core::Result<GracefulStopResult> {
+            Ok(GracefulStopResult::Exited {
+                exit: ProcessExit {
+                    code: Some(0),
+                    success: true,
+                },
+            })
+        }
+
+        fn force_terminate(
+            &mut self,
+            _: StopEscalationToken,
+        ) -> minedock_core::Result<ProcessExit> {
+            Ok(ProcessExit {
+                code: Some(1),
+                success: false,
+            })
+        }
+
+        fn force_cleanup_after_start_failure(&mut self) -> minedock_core::Result<ProcessExit> {
+            Ok(ProcessExit {
+                code: Some(1),
+                success: false,
+            })
+        }
+
+        fn try_wait(&mut self) -> minedock_core::Result<Option<ProcessExit>> {
+            Ok(None)
+        }
+
+        fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestProcessFactory;
+
+    impl ProcessFactory for TestProcessFactory {
+        type Process = TestProcess;
+
+        fn spawn(
+            &mut self,
+            spec: &LaunchSpec,
+            session_id: SessionId,
+        ) -> minedock_core::Result<Self::Process> {
+            Ok(TestProcess {
+                world_id: spec.world_id,
+                session_id,
+            })
+        }
+    }
+
+    fn test_launch_spec(world_id: WorldId) -> LaunchSpec {
+        LaunchSpec {
+            executable: PathBuf::from("/java"),
+            args: vec![OsString::from("-version")],
+            current_dir: PathBuf::from("/world"),
+            world_id,
+        }
+    }
 
     #[test]
     fn ime_range_handles_non_ascii_prefixes() {
@@ -1377,6 +1834,7 @@ mod tests {
                 .is_accepted()
                 .expect("missing record is readable")
         );
+        assert!(eula_requires_confirmation(&repository).expect("EULA state is readable"));
         assert_eq!(EULA_ACCEPTANCE_FILE, "eula-acceptance.json");
     }
 
@@ -1400,5 +1858,81 @@ mod tests {
                 .is_some()
         );
         assert!(repository.is_accepted().expect("record is readable"));
+        assert!(!eula_requires_confirmation(&repository).expect("EULA state is readable"));
+    }
+
+    #[test]
+    fn java_not_ready_becomes_an_actionable_start_error() {
+        let readiness = JavaReadiness {
+            required: JavaRequirement::from_major(JavaMajor::new(21).expect("major")),
+            runtime: None,
+            reasons: vec![JavaUnavailableReason::NoCandidates],
+        };
+
+        let error = select_java_runtime(readiness).expect_err("Java must be required");
+        let message = error.to_string();
+        assert!(message.contains("No Java executable candidates were found"));
+        assert!(message.contains("Choose a compatible Java executable"));
+    }
+
+    #[test]
+    fn start_is_enabled_only_for_a_stopped_unreserved_world() {
+        use minedock_core::WorldStatus;
+
+        assert!(start_allowed(WorldStatus::Stopped, true, false, false));
+        for status in [
+            WorldStatus::Preparing,
+            WorldStatus::Starting,
+            WorldStatus::Running,
+            WorldStatus::Stopping,
+            WorldStatus::BackingUp,
+            WorldStatus::Failed,
+        ] {
+            assert!(!start_allowed(status, true, false, false));
+        }
+        assert!(!start_allowed(WorldStatus::Stopped, false, false, false));
+        assert!(!start_allowed(WorldStatus::Stopped, true, true, false));
+        assert!(!start_allowed(WorldStatus::Stopped, true, false, true));
+    }
+
+    #[test]
+    fn start_orchestration_reaches_running_with_test_doubles() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory,
+            TestLeaseProvider,
+        );
+        let (lifecycle, result) = execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+            Ok(test_launch_spec(world_id))
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::Running)
+        );
+        assert!(lifecycle.session_id(world_id).is_some());
+    }
+
+    #[test]
+    fn start_orchestration_rejects_a_second_start_for_the_same_world() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory,
+            TestLeaseProvider,
+        );
+        let (lifecycle, first) = execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+            Ok(test_launch_spec(world_id))
+        });
+        assert!(first.is_ok());
+
+        let (_, second) = execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+            Ok(test_launch_spec(world_id))
+        });
+        assert!(second.is_err());
     }
 }
