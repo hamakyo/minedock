@@ -20,8 +20,8 @@ use gpui::{
 use minedock_core::{
     CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository, JavaReadiness,
     JavaRuntime, JsonWorldRepository, LaunchSpec, LifecycleSupervisor, MineDockError,
-    OFFICIAL_EULA_URL, SessionId, TemplateCatalog, TemplateId, World, WorldId, WorldLibrary,
-    WorldStatus, normalize_world_name,
+    OFFICIAL_EULA_URL, ProcessExit, SessionId, StopEscalationToken, StopOutcome, TemplateCatalog,
+    TemplateId, World, WorldId, WorldLibrary, WorldStatus, normalize_world_name,
 };
 
 #[allow(dead_code)]
@@ -36,6 +36,8 @@ type AppLifecycle = LifecycleSupervisor<
     native_process::NativeProcessFactory,
     lifecycle_adapter::AppDataLeaseProvider,
 >;
+type LifecyclePollResult = (WorldId, minedock_core::Result<Option<ProcessExit>>);
+type LifecyclePollResults = Vec<LifecyclePollResult>;
 
 struct PreparedLaunch {
     launch_spec: LaunchSpec,
@@ -45,6 +47,24 @@ struct PreparedLaunch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartProgress {
     Starting,
+}
+
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleOperation {
+    Starting(WorldId),
+    Stopping(WorldId),
+    ForceStopping(WorldId),
+    Polling,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorldAction {
+    Start,
+    Stop,
+    ForceStop,
+    None,
 }
 
 fn prepare_launch(
@@ -116,6 +136,28 @@ fn start_allowed(
     lifecycle_available && !operation_active && !session_active && status == WorldStatus::Stopped
 }
 
+fn stop_allowed(
+    status: WorldStatus,
+    lifecycle_available: bool,
+    operation_active: bool,
+    session_active: bool,
+) -> bool {
+    lifecycle_available && !operation_active && session_active && status == WorldStatus::Running
+}
+
+fn poll_exit_allowed(
+    active_operation: Option<LifecycleOperation>,
+    pending_force_stop_world: Option<WorldId>,
+) -> bool {
+    match active_operation {
+        None => true,
+        Some(LifecycleOperation::Stopping(world_id)) => pending_force_stop_world == Some(world_id),
+        Some(LifecycleOperation::Starting(_))
+        | Some(LifecycleOperation::ForceStopping(_))
+        | Some(LifecycleOperation::Polling) => false,
+    }
+}
+
 fn execute_lifecycle_start<P, F, L, Resolve>(
     mut lifecycle: LifecycleSupervisor<P, F, L>,
     app_data_root: &Path,
@@ -138,6 +180,58 @@ where
         resolve_launch,
     );
     (lifecycle, result)
+}
+
+fn execute_lifecycle_stop<P, F, L>(
+    mut lifecycle: LifecycleSupervisor<P, F, L>,
+    world_id: WorldId,
+) -> (
+    LifecycleSupervisor<P, F, L>,
+    minedock_core::Result<Option<StopOutcome>>,
+)
+where
+    P: minedock_core::LifecyclePersistence,
+    F: minedock_core::ProcessFactory,
+    L: minedock_core::LifecycleLeaseProvider,
+{
+    let result = lifecycle.stop(world_id, STOP_TIMEOUT);
+    (lifecycle, result)
+}
+
+fn execute_lifecycle_force_stop<P, F, L>(
+    mut lifecycle: LifecycleSupervisor<P, F, L>,
+    world_id: WorldId,
+    token: StopEscalationToken,
+) -> (
+    LifecycleSupervisor<P, F, L>,
+    minedock_core::Result<ProcessExit>,
+)
+where
+    P: minedock_core::LifecyclePersistence,
+    F: minedock_core::ProcessFactory,
+    L: minedock_core::LifecycleLeaseProvider,
+{
+    let result = lifecycle.force_terminate(world_id, token);
+    (lifecycle, result)
+}
+
+fn execute_lifecycle_poll<P, F, L>(
+    mut lifecycle: LifecycleSupervisor<P, F, L>,
+    world_ids: impl IntoIterator<Item = WorldId>,
+) -> (LifecycleSupervisor<P, F, L>, LifecyclePollResults)
+where
+    P: minedock_core::LifecyclePersistence,
+    F: minedock_core::ProcessFactory,
+    L: minedock_core::LifecycleLeaseProvider,
+{
+    let results = world_ids
+        .into_iter()
+        .map(|world_id| {
+            let result = lifecycle.poll_exit(world_id);
+            (world_id, result)
+        })
+        .collect();
+    (lifecycle, results)
 }
 
 actions!(
@@ -794,9 +888,10 @@ struct MineDockView {
     eula_open: bool,
     pending_start: Option<WorldId>,
     eula_error: Option<String>,
-    active_start: Option<WorldId>,
+    active_operation: Option<LifecycleOperation>,
+    pending_force_stop: Option<(WorldId, StopEscalationToken)>,
     status_overrides: HashMap<WorldId, WorldStatus>,
-    start_error: Option<String>,
+    lifecycle_error: Option<String>,
 }
 
 impl MineDockView {
@@ -819,9 +914,10 @@ impl MineDockView {
                     eula_open: false,
                     pending_start: None,
                     eula_error: None,
-                    active_start: None,
+                    active_operation: None,
+                    pending_force_stop: None,
                     status_overrides: HashMap::new(),
-                    start_error: None,
+                    lifecycle_error: None,
                 };
             }
         };
@@ -900,6 +996,17 @@ impl MineDockView {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                if this.update(cx, |view, cx| view.poll_exit_once(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
             library,
             _app_data_lease: app_data_lease,
@@ -914,9 +1021,10 @@ impl MineDockView {
             eula_open: false,
             pending_start: None,
             eula_error: None,
-            active_start: None,
+            active_operation: None,
+            pending_force_stop: None,
             status_overrides: HashMap::new(),
-            start_error: None,
+            lifecycle_error: None,
         }
     }
 
@@ -933,7 +1041,7 @@ impl MineDockView {
         self.pending_start = Some(world_id);
         self.eula_open = true;
         self.eula_error = None;
-        self.start_error = None;
+        self.lifecycle_error = None;
         cx.notify();
     }
 
@@ -1014,9 +1122,156 @@ impl MineDockView {
         start_allowed(
             world.status,
             self.can_mutate() && self._lifecycle.is_some(),
-            self.active_start.is_some(),
+            self.active_operation.is_some(),
             session_active,
         )
+    }
+
+    fn can_stop_world(&self, world_id: WorldId) -> bool {
+        let Some(world) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.get(world_id))
+        else {
+            return false;
+        };
+        let session_active = self
+            ._lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.session_id(world_id).is_some());
+        stop_allowed(
+            world.status,
+            self.can_mutate() && self._lifecycle.is_some(),
+            self.active_operation.is_some(),
+            session_active,
+        )
+    }
+
+    fn can_force_stop_world(&self, world_id: WorldId) -> bool {
+        self.pending_force_stop
+            .as_ref()
+            .is_some_and(|(pending_world_id, _)| *pending_world_id == world_id)
+            && self.active_operation == Some(LifecycleOperation::Stopping(world_id))
+            && self._lifecycle.is_some()
+    }
+
+    fn poll_exit_once(&mut self, cx: &mut Context<Self>) {
+        let pending_force_stop_world = self
+            .pending_force_stop
+            .as_ref()
+            .map(|(world_id, _)| *world_id);
+        if !poll_exit_allowed(self.active_operation, pending_force_stop_world) {
+            return;
+        }
+        let Some(lifecycle) = self._lifecycle.take() else {
+            return;
+        };
+        let world_ids: Vec<_> = self
+            .library
+            .as_ref()
+            .map(|library| {
+                library
+                    .list()
+                    .iter()
+                    .filter(|world| {
+                        world.status == WorldStatus::Running
+                            || pending_force_stop_world == Some(world.id)
+                    })
+                    .filter(|world| lifecycle.session_id(world.id).is_some())
+                    .map(|world| world.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if world_ids.is_empty() {
+            self._lifecycle = Some(lifecycle);
+            return;
+        }
+
+        self.active_operation = Some(LifecycleOperation::Polling);
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_lifecycle_poll(lifecycle, world_ids) });
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, results) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                let mut errors = Vec::new();
+                let mut should_reload = false;
+                let mut late_stop_completed = false;
+                let mut pending_force_stop_is_active = false;
+                let pending_force_stop_world = view
+                    .pending_force_stop
+                    .as_ref()
+                    .map(|(world_id, _)| *world_id);
+                for (world_id, result) in results {
+                    match result {
+                        Ok(Some(exit)) => {
+                            should_reload = true;
+                            view.status_overrides.remove(&world_id);
+                            if pending_force_stop_world == Some(world_id) {
+                                view.pending_force_stop = None;
+                                if exit.success {
+                                    late_stop_completed = true;
+                                } else {
+                                    errors.push(format!(
+                                        "World process exited after graceful stop timed out (code {:?}); it was marked Failed.",
+                                        exit.code
+                                    ));
+                                }
+                            } else {
+                                errors.push(format!(
+                                    "World process exited unexpectedly (code {:?}; success={}); it was marked Failed.",
+                                    exit.code, exit.success
+                                ));
+                            }
+                        }
+                        Ok(None) => {
+                            if pending_force_stop_world == Some(world_id) {
+                                pending_force_stop_is_active = true;
+                            }
+                        }
+                        Err(error) => {
+                            should_reload = true;
+                            if pending_force_stop_world == Some(world_id) {
+                                pending_force_stop_is_active = true;
+                            }
+                            errors.push(format!(
+                                "Could not observe world process state: {error}"
+                            ));
+                        }
+                    }
+                }
+                if pending_force_stop_is_active {
+                    if let Some((world_id, _)) = view.pending_force_stop {
+                        view.active_operation = Some(LifecycleOperation::Stopping(world_id));
+                    } else {
+                        view.active_operation = None;
+                    }
+                } else {
+                    view.active_operation = None;
+                }
+                if !errors.is_empty() {
+                    view.lifecycle_error = Some(errors.join(" "));
+                } else if late_stop_completed {
+                    view.lifecycle_error = None;
+                }
+                if should_reload {
+                    if let Some(library) = view.library.as_mut() {
+                        if let Err(error) = library.reload() {
+                            let refresh_error = format!(
+                                "MineDock could not refresh the persisted world state: {error}"
+                            );
+                            view.lifecycle_error = Some(match view.lifecycle_error.take() {
+                                Some(existing) => format!("{existing} {refresh_error}"),
+                                None => refresh_error,
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn start_world(
@@ -1030,7 +1285,7 @@ impl MineDockView {
             return;
         }
         let Some(repository) = self.eula_repository() else {
-            self.start_error = Some("MineDock's app-data directory is unavailable.".into());
+            self.lifecycle_error = Some("MineDock's app-data directory is unavailable.".into());
             cx.notify();
             return;
         };
@@ -1038,7 +1293,7 @@ impl MineDockView {
             Ok(false) => self.begin_start(world_id, cx),
             Ok(true) => self.request_eula_confirmation(world_id, cx),
             Err(error) => {
-                self.start_error = Some(format!(
+                self.lifecycle_error = Some(format!(
                     "MineDock could not check Minecraft EULA acceptance: {error}"
                 ));
                 cx.notify();
@@ -1048,7 +1303,7 @@ impl MineDockView {
 
     fn begin_start(&mut self, world_id: WorldId, cx: &mut Context<Self>) {
         if !self.can_start_world(world_id) {
-            self.start_error = Some(
+            self.lifecycle_error = Some(
                 "This world is no longer stopped or already has an active lifecycle operation."
                     .into(),
             );
@@ -1056,31 +1311,31 @@ impl MineDockView {
             return;
         }
         let Some(library) = self.library.as_ref() else {
-            self.start_error = Some("MineDock's world library is unavailable.".into());
+            self.lifecycle_error = Some("MineDock's world library is unavailable.".into());
             cx.notify();
             return;
         };
         let Some(world) = library.get(world_id).cloned() else {
-            self.start_error = Some("The selected world no longer exists.".into());
+            self.lifecycle_error = Some("The selected world no longer exists.".into());
             cx.notify();
             return;
         };
         let app_data_root = library.repository().root().to_path_buf();
         let Some(eula) = self.eula_repository() else {
-            self.start_error = Some("MineDock's app-data directory is unavailable.".into());
+            self.lifecycle_error = Some("MineDock's app-data directory is unavailable.".into());
             cx.notify();
             return;
         };
         let Some(lifecycle) = self._lifecycle.take() else {
-            self.start_error = Some("The lifecycle runtime is unavailable.".into());
+            self.lifecycle_error = Some("The lifecycle runtime is unavailable.".into());
             cx.notify();
             return;
         };
 
-        self.active_start = Some(world_id);
+        self.active_operation = Some(LifecycleOperation::Starting(world_id));
         self.status_overrides
             .insert(world_id, WorldStatus::Preparing);
-        self.start_error = None;
+        self.lifecycle_error = None;
         cx.notify();
 
         let (progress_sender, progress_receiver) = mpsc::channel();
@@ -1099,7 +1354,7 @@ impl MineDockView {
                 while let Ok(progress) = progress_receiver.try_recv() {
                     drained = true;
                     let _ = this.update(cx, |view, cx| {
-                        if view.active_start != Some(world_id) {
+                        if view.active_operation != Some(LifecycleOperation::Starting(world_id)) {
                             return;
                         }
                         match progress {
@@ -1125,17 +1380,17 @@ impl MineDockView {
             let (lifecycle, java_status, result) = worker.await;
             let _ = this.update(cx, |view, cx| {
                 view._lifecycle = Some(lifecycle);
-                view.active_start = None;
+                view.active_operation = None;
                 view.status_overrides.remove(&world_id);
                 if let Some(java_status) = java_status {
                     view.java_status = java_status;
                 }
                 match result {
                     Ok(_) => {
-                        view.start_error = None;
+                        view.lifecycle_error = None;
                     }
                     Err(error) => {
-                        view.start_error = Some(format!("Could not start this world: {error}"));
+                        view.lifecycle_error = Some(format!("Could not start this world: {error}"));
                     }
                 }
                 if let Some(library) = view.library.as_mut() {
@@ -1143,7 +1398,161 @@ impl MineDockView {
                         let refresh_error = format!(
                             "MineDock could not refresh the persisted world state: {error}"
                         );
-                        view.start_error = Some(match view.start_error.take() {
+                        view.lifecycle_error = Some(match view.lifecycle_error.take() {
+                            Some(existing) => format!("{existing} {refresh_error}"),
+                            None => refresh_error,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn stop_world(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_stop_world(world_id) {
+            return;
+        }
+        if self.library.is_none() {
+            self.lifecycle_error = Some("MineDock's world library is unavailable.".into());
+            cx.notify();
+            return;
+        }
+        let Some(lifecycle) = self._lifecycle.take() else {
+            self.lifecycle_error = Some("The lifecycle runtime is unavailable.".into());
+            cx.notify();
+            return;
+        };
+
+        self.active_operation = Some(LifecycleOperation::Stopping(world_id));
+        self.pending_force_stop = None;
+        self.status_overrides
+            .insert(world_id, WorldStatus::Stopping);
+        self.lifecycle_error = None;
+        cx.notify();
+
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_lifecycle_stop(lifecycle, world_id) });
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, result) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                match result {
+                    Ok(Some(StopOutcome::Exited { exit })) => {
+                        view.active_operation = None;
+                        view.pending_force_stop = None;
+                        view.status_overrides.remove(&world_id);
+                        view.lifecycle_error = if exit.success {
+                            None
+                        } else {
+                            Some(format!(
+                                "World stop completed with a failure (exit code {:?}); it was marked Failed.",
+                                exit.code
+                            ))
+                        };
+                    }
+                    Ok(Some(StopOutcome::TimedOut(token))) => {
+                        view.active_operation = Some(LifecycleOperation::Stopping(world_id));
+                        view.pending_force_stop = Some((world_id, token));
+                        view.status_overrides
+                            .insert(world_id, WorldStatus::Stopping);
+                        view.lifecycle_error = Some(
+                            "Graceful stop timed out; the server is still running. Use Force Stop only if you accept possible data loss.".into(),
+                        );
+                    }
+                    Ok(None) => {
+                        view.active_operation = None;
+                        view.pending_force_stop = None;
+                        view.status_overrides.remove(&world_id);
+                        view.lifecycle_error = Some(
+                            "MineDock could not stop this world because no active lifecycle session was found.".into(),
+                        );
+                    }
+                    Err(error) => {
+                        view.active_operation = None;
+                        view.pending_force_stop = None;
+                        view.status_overrides.remove(&world_id);
+                        view.lifecycle_error =
+                            Some(format!("Could not stop this world: {error}"));
+                    }
+                }
+                if let Some(library) = view.library.as_mut() {
+                    if let Err(error) = library.reload() {
+                        let refresh_error = format!(
+                            "MineDock could not refresh the persisted world state: {error}"
+                        );
+                        view.lifecycle_error = Some(match view.lifecycle_error.take() {
+                            Some(existing) => format!("{existing} {refresh_error}"),
+                            None => refresh_error,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn force_stop_world(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_force_stop_world(world_id) {
+            return;
+        }
+        let Some((_, token)) = self.pending_force_stop else {
+            return;
+        };
+        let Some(lifecycle) = self._lifecycle.take() else {
+            self.lifecycle_error = Some("The lifecycle runtime is unavailable.".into());
+            cx.notify();
+            return;
+        };
+
+        self.active_operation = Some(LifecycleOperation::ForceStopping(world_id));
+        self.lifecycle_error = Some("Force stop is terminating the server process…".into());
+        cx.notify();
+
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_lifecycle_force_stop(lifecycle, world_id, token) });
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, result) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                match result {
+                    Ok(exit) => {
+                        view.active_operation = None;
+                        view.pending_force_stop = None;
+                        view.status_overrides.remove(&world_id);
+                        view.lifecycle_error = Some(format!(
+                            "The server was force-stopped and marked Failed (exit code {:?}).",
+                            exit.code
+                        ));
+                    }
+                    Err(error) => {
+                        view.active_operation = Some(LifecycleOperation::Stopping(world_id));
+                        view.lifecycle_error =
+                            Some(format!("Could not force-stop this world: {error}"));
+                    }
+                }
+                if let Some(library) = view.library.as_mut() {
+                    if let Err(error) = library.reload() {
+                        let refresh_error = format!(
+                            "MineDock could not refresh the persisted world state: {error}"
+                        );
+                        view.lifecycle_error = Some(match view.lifecycle_error.take() {
                             Some(existing) => format!("{existing} {refresh_error}"),
                             None => refresh_error,
                         });
@@ -1317,12 +1726,32 @@ impl MineDockView {
                 let world_id = world.id;
                 let status = self.displayed_status(&world);
                 let start_enabled = self.can_start_world(world_id);
+                let stop_enabled = self.can_stop_world(world_id);
+                let force_stop_enabled = self.can_force_stop_world(world_id);
+                let action = match status {
+                    WorldStatus::Stopped => WorldAction::Start,
+                    WorldStatus::Running => WorldAction::Stop,
+                    WorldStatus::Stopping if force_stop_enabled => WorldAction::ForceStop,
+                    _ => WorldAction::None,
+                };
+                let action_enabled = match action {
+                    WorldAction::Start => start_enabled,
+                    WorldAction::Stop => stop_enabled,
+                    WorldAction::ForceStop => true,
+                    WorldAction::None => false,
+                };
                 cards = cards.child(world_card(
                     &world,
                     status,
-                    start_enabled,
-                    cx.listener(move |view, event, window, cx| {
-                        view.start_world(world_id, event, window, cx)
+                    action,
+                    action_enabled,
+                    cx.listener(move |view, event, window, cx| match action {
+                        WorldAction::Start => view.start_world(world_id, event, window, cx),
+                        WorldAction::Stop => view.stop_world(world_id, event, window, cx),
+                        WorldAction::ForceStop => {
+                            view.force_stop_world(world_id, event, window, cx)
+                        }
+                        WorldAction::None => {}
                     }),
                 ));
             }
@@ -1531,7 +1960,7 @@ impl Render for MineDockView {
                     )),
             );
         }
-        if let Some(error) = &self.start_error {
+        if let Some(error) = &self.lifecycle_error {
             content = content.child(
                 div()
                     .p(px(12.))
@@ -1582,8 +2011,9 @@ fn button(
 fn world_card(
     world: &World,
     status: WorldStatus,
-    start_enabled: bool,
-    start_handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    action: WorldAction,
+    action_enabled: bool,
+    action_handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let (indicator, status_color) = match status {
         WorldStatus::Stopped => ("○", rgb(0xA1A8B5)),
@@ -1592,33 +2022,44 @@ fn world_card(
         _ => ("◌", rgb(0xF0C674)),
     };
     let status_text = format!("{indicator}  {status:?}");
-    let action_text = match status {
-        WorldStatus::Stopped => "START",
-        WorldStatus::Preparing => "PREPARING",
-        WorldStatus::Starting => "STARTING",
-        WorldStatus::Running => "RUNNING",
-        WorldStatus::Stopping => "STOPPING",
-        WorldStatus::BackingUp => "BACKING UP",
-        WorldStatus::Failed => "RECOVER REQUIRED",
+    let action_text = match action {
+        WorldAction::Start => "START",
+        WorldAction::Stop => "STOP",
+        WorldAction::ForceStop => "FORCE STOP",
+        WorldAction::None => match status {
+            WorldStatus::Stopped => "START",
+            WorldStatus::Preparing => "PREPARING",
+            WorldStatus::Starting => "STARTING",
+            WorldStatus::Running => "STOP",
+            WorldStatus::Stopping => "STOPPING",
+            WorldStatus::BackingUp => "BACKING UP",
+            WorldStatus::Failed => "RECOVER REQUIRED",
+        },
+    };
+    let action_color = match action {
+        WorldAction::Start => rgb(0x3D5A88),
+        WorldAction::Stop => rgb(0x8B4A4A),
+        WorldAction::ForceStop => rgb(0xA33E3E),
+        WorldAction::None => rgb(0x292E38),
     };
     let mut action = div()
-        .id(SharedString::from(format!("start-{}", world.id)))
+        .id(SharedString::from(format!("world-action-{}", world.id)))
         .px(px(14.))
         .py(px(8.))
         .rounded(px(8.))
-        .bg(if start_enabled {
-            rgb(0x3D5A88)
+        .bg(if action_enabled {
+            action_color
         } else {
             rgb(0x292E38)
         })
-        .text_color(if start_enabled {
+        .text_color(if action_enabled {
             rgb(0xF2F4F8)
         } else {
             rgb(0x777F8D)
         })
         .child(action_text);
-    if start_enabled {
-        action = action.focusable().on_click(start_handler);
+    if action_enabled {
+        action = action.focusable().on_click(action_handler);
     }
     div()
         .w_full()
@@ -1689,8 +2130,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        EULA_ACCEPTANCE_FILE, eula_acceptance_path, eula_requires_confirmation,
-        execute_lifecycle_start, select_java_runtime, start_allowed, utf16_range_to_byte_range,
+        EULA_ACCEPTANCE_FILE, LifecycleOperation, eula_acceptance_path, eula_requires_confirmation,
+        execute_lifecycle_force_stop, execute_lifecycle_poll, execute_lifecycle_start,
+        execute_lifecycle_stop, poll_exit_allowed, select_java_runtime, start_allowed,
+        stop_allowed, utf16_range_to_byte_range,
     };
     use minedock_core::{
         EulaAcceptanceRepository, FileEulaAcceptanceRepository, GracefulStopResult,
@@ -1721,6 +2164,9 @@ mod tests {
     struct TestProcess {
         world_id: WorldId,
         session_id: SessionId,
+        stop_times_out: bool,
+        exits_on_poll: bool,
+        poll_exit_success: bool,
     }
 
     impl ServerProcess for TestProcess {
@@ -1744,6 +2190,9 @@ mod tests {
             &mut self,
             _: std::time::Duration,
         ) -> minedock_core::Result<GracefulStopResult> {
+            if self.stop_times_out {
+                return Ok(GracefulStopResult::TimedOut);
+            }
             Ok(GracefulStopResult::Exited {
                 exit: ProcessExit {
                     code: Some(0),
@@ -1770,7 +2219,17 @@ mod tests {
         }
 
         fn try_wait(&mut self) -> minedock_core::Result<Option<ProcessExit>> {
-            Ok(None)
+            Ok(self.exits_on_poll.then_some(if self.poll_exit_success {
+                ProcessExit {
+                    code: Some(0),
+                    success: true,
+                }
+            } else {
+                ProcessExit {
+                    code: Some(1),
+                    success: false,
+                }
+            }))
         }
 
         fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
@@ -1779,7 +2238,11 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct TestProcessFactory;
+    struct TestProcessFactory {
+        stop_times_out: bool,
+        exits_on_poll: bool,
+        poll_exit_success: bool,
+    }
 
     impl ProcessFactory for TestProcessFactory {
         type Process = TestProcess;
@@ -1792,6 +2255,9 @@ mod tests {
             Ok(TestProcess {
                 world_id: spec.world_id,
                 session_id,
+                stop_times_out: self.stop_times_out,
+                exits_on_poll: self.exits_on_poll,
+                poll_exit_success: self.poll_exit_success,
             })
         }
     }
@@ -1896,12 +2362,58 @@ mod tests {
     }
 
     #[test]
+    fn stop_is_enabled_only_for_a_running_session_without_an_active_operation() {
+        assert!(stop_allowed(WorldStatus::Running, true, false, true));
+        for status in [
+            WorldStatus::Stopped,
+            WorldStatus::Preparing,
+            WorldStatus::Starting,
+            WorldStatus::Stopping,
+            WorldStatus::BackingUp,
+            WorldStatus::Failed,
+        ] {
+            assert!(!stop_allowed(status, true, false, true));
+        }
+        assert!(!stop_allowed(WorldStatus::Running, false, false, true));
+        assert!(!stop_allowed(WorldStatus::Running, true, true, true));
+        assert!(!stop_allowed(WorldStatus::Running, true, false, false));
+    }
+
+    #[test]
+    fn exit_polling_remains_available_while_waiting_for_force_escalation() {
+        let world_id = WorldId::new();
+        let other_world_id = WorldId::new();
+
+        assert!(poll_exit_allowed(None, None));
+        assert!(!poll_exit_allowed(
+            Some(LifecycleOperation::Starting(world_id)),
+            None
+        ));
+        assert!(!poll_exit_allowed(
+            Some(LifecycleOperation::Stopping(world_id)),
+            None
+        ));
+        assert!(poll_exit_allowed(
+            Some(LifecycleOperation::Stopping(world_id)),
+            Some(world_id)
+        ));
+        assert!(!poll_exit_allowed(
+            Some(LifecycleOperation::Stopping(world_id)),
+            Some(other_world_id)
+        ));
+        assert!(!poll_exit_allowed(
+            Some(LifecycleOperation::Polling),
+            Some(world_id)
+        ));
+    }
+
+    #[test]
     fn start_orchestration_reaches_running_with_test_doubles() {
         let root = TempDir::new().expect("temporary app data");
         let world_id = WorldId::new();
         let lifecycle = minedock_core::LifecycleSupervisor::new(
             InMemoryLifecyclePersistence::default(),
-            TestProcessFactory,
+            TestProcessFactory::default(),
             TestLeaseProvider,
         );
         let (lifecycle, result) = execute_lifecycle_start(lifecycle, root.path(), world_id, || {
@@ -1922,7 +2434,7 @@ mod tests {
         let world_id = WorldId::new();
         let lifecycle = minedock_core::LifecycleSupervisor::new(
             InMemoryLifecyclePersistence::default(),
-            TestProcessFactory,
+            TestProcessFactory::default(),
             TestLeaseProvider,
         );
         let (lifecycle, first) = execute_lifecycle_start(lifecycle, root.path(), world_id, || {
@@ -1934,5 +2446,144 @@ mod tests {
             Ok(test_launch_spec(world_id))
         });
         assert!(second.is_err());
+    }
+
+    #[test]
+    fn stop_orchestration_reaches_stopped_after_graceful_exit() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory::default(),
+            TestLeaseProvider,
+        );
+        let (lifecycle, started) =
+            execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+                Ok(test_launch_spec(world_id))
+            });
+        assert!(started.is_ok());
+
+        let (lifecycle, stopped) = execute_lifecycle_stop(lifecycle, world_id);
+        assert!(matches!(
+            stopped,
+            Ok(Some(minedock_core::StopOutcome::Exited { exit })) if exit.success
+        ));
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::Stopped)
+        );
+        assert!(lifecycle.session_id(world_id).is_none());
+    }
+
+    #[test]
+    fn stop_timeout_keeps_session_for_explicit_force_escalation() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory {
+                stop_times_out: true,
+                exits_on_poll: false,
+                poll_exit_success: false,
+            },
+            TestLeaseProvider,
+        );
+        let (lifecycle, started) =
+            execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+                Ok(test_launch_spec(world_id))
+            });
+        assert!(started.is_ok());
+
+        let (lifecycle, stopped) = execute_lifecycle_stop(lifecycle, world_id);
+        let token = match stopped.expect("stop result") {
+            Some(minedock_core::StopOutcome::TimedOut(token)) => token,
+            other => panic!("expected timeout, got {other:?}"),
+        };
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::Stopping)
+        );
+        assert!(lifecycle.session_id(world_id).is_some());
+
+        let (lifecycle, forced) = execute_lifecycle_force_stop(lifecycle, world_id, token);
+        assert!(!forced.expect("force stop").success);
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::Failed)
+        );
+        assert!(lifecycle.session_id(world_id).is_none());
+    }
+
+    #[test]
+    fn late_successful_exit_after_stop_timeout_reaches_stopped() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory {
+                stop_times_out: true,
+                exits_on_poll: true,
+                poll_exit_success: true,
+            },
+            TestLeaseProvider,
+        );
+        let (lifecycle, started) =
+            execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+                Ok(test_launch_spec(world_id))
+            });
+        assert!(started.is_ok());
+
+        let (lifecycle, stopped) = execute_lifecycle_stop(lifecycle, world_id);
+        let token = match stopped.expect("stop result") {
+            Some(minedock_core::StopOutcome::TimedOut(token)) => token,
+            other => panic!("expected timeout, got {other:?}"),
+        };
+        assert_eq!(token.world_id(), world_id);
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::Stopping)
+        );
+
+        let (lifecycle, results) = execute_lifecycle_poll(lifecycle, [world_id]);
+        assert!(matches!(
+            results.as_slice(),
+            [(id, Ok(Some(ProcessExit { success: true, .. })))] if *id == world_id
+        ));
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::Stopped)
+        );
+        assert!(lifecycle.session_id(world_id).is_none());
+    }
+
+    #[test]
+    fn polling_an_unexpected_exit_updates_failed_state() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory {
+                stop_times_out: false,
+                exits_on_poll: true,
+                poll_exit_success: false,
+            },
+            TestLeaseProvider,
+        );
+        let (lifecycle, started) =
+            execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+                Ok(test_launch_spec(world_id))
+            });
+        assert!(started.is_ok());
+
+        let (lifecycle, results) = execute_lifecycle_poll(lifecycle, [world_id]);
+        assert!(matches!(
+            results.as_slice(),
+            [(id, Ok(Some(ProcessExit { success: false, .. })))] if *id == world_id
+        ));
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::Failed)
+        );
+        assert!(lifecycle.session_id(world_id).is_none());
     }
 }
