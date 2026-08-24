@@ -30,6 +30,9 @@ mod java_adapter;
 mod lifecycle_adapter;
 mod native_process;
 mod native_safety;
+mod network;
+
+use network::LanAddressState;
 
 type AppLifecycle = LifecycleSupervisor<
     lifecycle_adapter::JsonLifecyclePersistence,
@@ -892,6 +895,8 @@ struct MineDockView {
     pending_force_stop: Option<(WorldId, StopEscalationToken)>,
     status_overrides: HashMap<WorldId, WorldStatus>,
     lifecycle_error: Option<String>,
+    lan_address_state: LanAddressState,
+    clipboard_notice: Option<String>,
 }
 
 impl MineDockView {
@@ -918,6 +923,8 @@ impl MineDockView {
                     pending_force_stop: None,
                     status_overrides: HashMap::new(),
                     lifecycle_error: None,
+                    lan_address_state: LanAddressState::Checking,
+                    clipboard_notice: None,
                 };
             }
         };
@@ -1007,6 +1014,25 @@ impl MineDockView {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let state = cx
+                    .background_executor()
+                    .spawn(async { network::discover_lan_address_state() })
+                    .await;
+                if this
+                    .update(cx, |view, cx| {
+                        view.lan_address_state = state;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+            }
+        })
+        .detach();
         Self {
             library,
             _app_data_lease: app_data_lease,
@@ -1025,6 +1051,8 @@ impl MineDockView {
             pending_force_stop: None,
             status_overrides: HashMap::new(),
             lifecycle_error: None,
+            lan_address_state: LanAddressState::Checking,
+            clipboard_notice: None,
         }
     }
 
@@ -1564,6 +1592,89 @@ impl MineDockView {
         .detach();
     }
 
+    fn copy_address(
+        &mut self,
+        endpoint: String,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(endpoint.clone()));
+        self.clipboard_notice = Some(format!("Copied {endpoint} to clipboard."));
+        cx.notify();
+    }
+
+    fn render_connection(
+        &mut self,
+        world_id: WorldId,
+        status: WorldStatus,
+        port: u16,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let mut section = div().flex().flex_col().gap(px(5.));
+        if status != WorldStatus::Running {
+            return section;
+        }
+
+        section = section.child(div().text_color(rgb(0xB9C0CC)).child("LAN connection"));
+        if port == 0 {
+            return section.child(
+                div()
+                    .text_color(rgb(0xFFB4B4))
+                    .child("Connection endpoint unavailable: configured server-port is invalid."),
+            );
+        }
+
+        match self.lan_address_state.clone() {
+            LanAddressState::Checking => section.child(
+                div()
+                    .text_color(rgb(0x91A0B7))
+                    .child("Checking for usable LAN IPv4 addresses…"),
+            ),
+            LanAddressState::Unavailable(reason) => section.child(
+                div()
+                    .text_color(rgb(0xFFB4B4))
+                    .child(format!("Connection endpoint unavailable: {reason}")),
+            ),
+            LanAddressState::Available(candidate) => {
+                let endpoint = candidate
+                    .endpoint(port)
+                    .expect("nonzero port was checked above");
+                let endpoint_for_copy = endpoint.clone();
+                let handler = cx.listener(move |view, event, window, cx| {
+                    view.copy_address(endpoint_for_copy.clone(), event, window, cx)
+                });
+                section.child(connection_endpoint_row(
+                    world_id,
+                    &endpoint,
+                    &candidate.interface_name,
+                    handler,
+                ))
+            }
+            LanAddressState::Ambiguous(candidates) => {
+                section = section.child(div().text_color(rgb(0xF0C674)).child(
+                    "Multiple LAN addresses found. Choose the interface your friend can reach:",
+                ));
+                for candidate in candidates {
+                    let endpoint = candidate
+                        .endpoint(port)
+                        .expect("nonzero port was checked above");
+                    let endpoint_for_copy = endpoint.clone();
+                    let handler = cx.listener(move |view, event, window, cx| {
+                        view.copy_address(endpoint_for_copy.clone(), event, window, cx)
+                    });
+                    section = section.child(connection_endpoint_row(
+                        world_id,
+                        &endpoint,
+                        &candidate.interface_name,
+                        handler,
+                    ));
+                }
+                section
+            }
+        }
+    }
+
     fn open_wizard(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.can_mutate() {
             self.wizard_open = true;
@@ -1728,6 +1839,7 @@ impl MineDockView {
                 let start_enabled = self.can_start_world(world_id);
                 let stop_enabled = self.can_stop_world(world_id);
                 let force_stop_enabled = self.can_force_stop_world(world_id);
+                let connection = self.render_connection(world_id, status, world.server.port, cx);
                 let action = match status {
                     WorldStatus::Stopped => WorldAction::Start,
                     WorldStatus::Running => WorldAction::Stop,
@@ -1745,6 +1857,7 @@ impl MineDockView {
                     status,
                     action,
                     action_enabled,
+                    connection,
                     cx.listener(move |view, event, window, cx| match action {
                         WorldAction::Start => view.start_world(world_id, event, window, cx),
                         WorldAction::Stop => view.stop_world(world_id, event, window, cx),
@@ -1970,6 +2083,16 @@ impl Render for MineDockView {
                     .child(error.clone()),
             );
         }
+        if let Some(notice) = &self.clipboard_notice {
+            content = content.child(
+                div()
+                    .p(px(12.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x1D3A2A))
+                    .text_color(rgb(0xA7F3C0))
+                    .child(notice.clone()),
+            );
+        }
         if self.wizard_open {
             content = content.child(self.render_wizard(cx));
         }
@@ -2008,11 +2131,51 @@ fn button(
     button
 }
 
+fn connection_endpoint_row(
+    world_id: WorldId,
+    endpoint: &str,
+    interface_name: &str,
+    handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .justify_between()
+        .items_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().text_color(rgb(0xE7EEFF)).child(endpoint.to_owned()))
+                .child(
+                    div()
+                        .text_color(rgb(0x707987))
+                        .child(format!("via {interface_name}")),
+                ),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "copy-address-{world_id}-{endpoint}"
+                )))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(7.))
+                .bg(rgb(0x34415C))
+                .text_color(rgb(0xE7EEFF))
+                .child("COPY")
+                .focusable()
+                .on_click(handler),
+        )
+}
+
 fn world_card(
     world: &World,
     status: WorldStatus,
     action: WorldAction,
     action_enabled: bool,
+    connection: impl IntoElement,
     action_handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let (indicator, status_color) = match status {
@@ -2081,6 +2244,7 @@ fn world_card(
                         .child(format!("Vanilla · {}", world.server.version)),
                 )
                 .child(div().text_color(status_color).child(status_text))
+                .child(connection)
                 .child(
                     div()
                         .text_color(rgb(0x707987))

@@ -1,6 +1,6 @@
 # Security Notes
 
-This document distinguishes controls present in the Phase 0–5 foundations from the initial Phase 6 GPUI Start/EULA workflow and the remaining MVP work. The current GPUI can begin provider-backed server preparation from a stopped world; Stop, backups, and networking UX remain open.
+This document distinguishes controls present in the Phase 0–5 foundations from the Phase 6 GPUI Start/EULA/Stop workflow and the remaining MVP work. The current GPUI can begin provider-backed server preparation from a stopped world and exposes conservative LAN endpoint candidates; backups remain open.
 
 ## Defaults
 
@@ -93,7 +93,7 @@ UI must clearly distinguish:
 - explicitly configured direct exposure
 - future private-network modes
 
-The current UI does not start a listening server or configure firewall/router rules. LAN address/port display and direct-exposure guidance remain Phase 9 work.
+The UI does not configure firewall/router rules or claim internet reachability. It displays the configured `server-port` with usable private IPv4 candidates discovered from operational Windows adapters. Multiple candidates are shown as ambiguous with per-address copy actions; MineDock does not claim to know which interface a peer can reach. Direct internet exposure guidance remains separate from this LAN-only feature.
 
 ## Verification limits
 
