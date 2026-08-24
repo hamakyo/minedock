@@ -19,7 +19,7 @@ MineDock presents durable Worlds rather than server folders. A server process is
 
 ## Current status
 
-Phases 0–5 of the implementation plan provide the application shell and core/runtime foundations, with the initial Phase 6 Start/EULA wiring now connected:
+Phases 0–5 of the implementation plan provide the application shell and core/runtime foundations, with the initial Phase 6 Start/EULA/Stop wiring and Phase 9 LAN endpoint UX now connected:
 
 - a runnable GPUI 0.2.2 desktop application;
 - a dark World Library with a metadata-only create-world wizard;
@@ -30,8 +30,9 @@ Phases 0–5 of the implementation plan provide the application shell and core/r
 - an authoritative Vanilla release/JAR provider with bounded HTTPS redirects, hash/size validation, and a versioned cache;
 - a persisted explicit-EULA-acceptance gate, deterministic `server.properties`, and `online-mode=true` launch validation;
 - a shell-free native Java process adapter with graceful `stop`, bounded escalation, log events, per-world start reservations, and Windows Job Object containment.
+- a Windows LAN endpoint adapter that uses each world's configured `server-port`, shows multiple private IPv4 candidates conservatively, and provides per-address clipboard copy actions.
 
-World cards now enable **Start** only for stopped, unreserved worlds. Start checks the persisted EULA acceptance, shows the explicit confirmation dialog when needed, then resolves the authoritative release, checks Java, provisions the world, and launches through the existing lifecycle/process adapter in the background. **Stop**, backups, logs/player UX, and networking UX are not implemented yet. Opening the app or creating a world still does not download a JAR or launch a server.
+World cards now enable **Start** only for stopped, unreserved worlds and expose graceful **Stop** controls for running worlds. Start checks the persisted EULA acceptance, shows the explicit confirmation dialog when needed, then resolves the authoritative release, checks Java, provisions the world, and launches through the existing lifecycle/process adapter in the background. Running worlds show their configured LAN endpoint; when multiple private IPv4 candidates exist, MineDock labels the result as ambiguous instead of selecting one silently. Backups and logs/player UX remain open. Opening the app or creating a world still does not download a JAR or launch a server.
 
 The target MVP remains the end-to-end scenario in [docs/MVP.md](docs/MVP.md); checklist status is tracked in [PLAN.md](PLAN.md).
 

@@ -1,6 +1,6 @@
 # MineDock Implementation Plan
 
-Checklist status reflects code and tests in the repository, not the final MVP acceptance scenario. Phases 0–5 have implementation foundations, and the initial Phase 6 Start/EULA wiring is now present. Stop, logs, backups, networking, and the remaining MVP acceptance work are still open.
+Checklist status reflects code and tests in the repository, not the final MVP acceptance scenario. Phases 0–5 have implementation foundations, and the initial Phase 6 Start/EULA/Stop wiring plus Phase 9 LAN endpoint UX are now present. Logs, backups, and the remaining MVP acceptance work are still open.
 
 ## Phase 0 — Stabilize scaffold
 
@@ -86,7 +86,7 @@ Exit:
 
 - [x] Render persisted world cards.
 - [x] Start action: resolve, provision, and launch through the lifecycle runtime.
-- [ ] Stop action.
+- [x] Stop action.
 - [x] Lifecycle indicators.
 - [ ] Player count if known.
 - [ ] World detail panel.
@@ -122,10 +122,10 @@ Exit:
 
 ## Phase 9 — Networking UX
 
-- [ ] Show listening port.
-- [ ] Show LAN address(es).
-- [ ] Copy connection address.
-- [ ] Basic bind/port diagnostics.
+- [x] Show the configured listening port.
+- [x] Show usable LAN IPv4 address(es) without guessing when candidates are ambiguous.
+- [x] Copy connection address.
+- [x] Show basic no-address and invalid-configured-port diagnostics.
 - [ ] Document direct internet hosting without silently changing router/firewall.
 
 Exit:
