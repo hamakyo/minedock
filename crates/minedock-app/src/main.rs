@@ -1,4 +1,8 @@
-use std::{ops::Range, path::PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 use gpui::{
     App, Application, Bounds, Context, Element, ElementId, ElementInputHandler, Entity,
@@ -7,8 +11,9 @@ use gpui::{
     WindowBounds, WindowOptions, actions, div, fill, prelude::*, px, relative, rgb, rgba, size,
 };
 use minedock_core::{
-    CreateWorldRequest, JsonWorldRepository, LifecycleSupervisor, TemplateCatalog, TemplateId,
-    World, WorldLibrary, WorldStatus, normalize_world_name,
+    CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository,
+    JsonWorldRepository, LifecycleSupervisor, OFFICIAL_EULA_URL, TemplateCatalog, TemplateId,
+    World, WorldId, WorldLibrary, WorldStatus, normalize_world_name,
 };
 
 #[allow(dead_code)]
@@ -51,6 +56,48 @@ pub fn resolve_app_data_root() -> anyhow::Result<PathBuf> {
         anyhow::anyhow!("LOCALAPPDATA is not set; set MINEDOCK_DATA_DIR to choose a data directory")
     })?;
     Ok(PathBuf::from(local_app_data).join("MineDock"))
+}
+
+const EULA_ACCEPTANCE_FILE: &str = "eula-acceptance.json";
+
+fn eula_acceptance_path(app_data_root: &Path) -> PathBuf {
+    app_data_root.join(EULA_ACCEPTANCE_FILE)
+}
+
+fn open_external_url(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("rundll32.exe");
+        command.args(["url.dll,FileProtocolHandler", url]);
+        command
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening external URLs is unsupported on this platform",
+    ));
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 #[derive(Debug)]
@@ -632,6 +679,9 @@ struct MineDockView {
     selected_template: Option<TemplateId>,
     wizard_error: Option<String>,
     java_status: String,
+    eula_open: bool,
+    pending_start: Option<WorldId>,
+    eula_error: Option<String>,
 }
 
 impl MineDockView {
@@ -651,6 +701,9 @@ impl MineDockView {
                     selected_template: None,
                     wizard_error: None,
                     java_status: "Java readiness unavailable".into(),
+                    eula_open: false,
+                    pending_start: None,
+                    eula_error: None,
                 };
             }
         };
@@ -740,6 +793,70 @@ impl MineDockView {
             selected_template,
             wizard_error: None,
             java_status: "Checking Java readiness…".into(),
+            eula_open: false,
+            pending_start: None,
+            eula_error: None,
+        }
+    }
+
+    fn eula_repository(&self) -> Option<FileEulaAcceptanceRepository> {
+        self.library.as_ref().map(|library| {
+            FileEulaAcceptanceRepository::new(eula_acceptance_path(library.repository().root()))
+        })
+    }
+
+    /// Open the explicit EULA step for a pending Start request. The actual
+    /// acceptance is recorded only by `accept_eula` after the user clicks
+    /// `I Agree`.
+    fn request_eula_confirmation(&mut self, world_id: WorldId, cx: &mut Context<Self>) {
+        self.pending_start = Some(world_id);
+        self.eula_open = true;
+        self.eula_error = None;
+        cx.notify();
+    }
+
+    fn open_eula_link(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = open_external_url(OFFICIAL_EULA_URL) {
+            self.eula_error = Some(format!(
+                "Could not open the official Minecraft EULA: {error}. Visit {OFFICIAL_EULA_URL}"
+            ));
+            cx.notify();
+        }
+    }
+
+    fn cancel_eula(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.eula_open = false;
+        self.pending_start = None;
+        self.eula_error = None;
+        cx.notify();
+    }
+
+    fn accept_eula(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.eula_repository() else {
+            self.eula_error = Some("MineDock's app-data directory is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        match repository.record_explicit_acceptance(true) {
+            Ok(Some(_)) => {
+                self.eula_open = false;
+                self.eula_error = None;
+                // Keep pending_start until the Start coordinator resumes it.
+                cx.notify();
+            }
+            Ok(None) => {
+                self.eula_error = Some(
+                    "EULA acceptance was not recorded because no affirmative action was provided."
+                        .into(),
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                self.eula_error = Some(format!(
+                    "MineDock could not save your EULA acceptance: {error}"
+                ));
+                cx.notify();
+            }
         }
     }
 
@@ -1021,6 +1138,64 @@ impl MineDockView {
                     ),
             )
     }
+
+    fn render_eula_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0xCC0D1016))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(560.))
+                    .p(px(24.))
+                    .rounded(px(14.))
+                    .bg(rgb(0x202631))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .child(div().text_size(px(22.)).child("Minecraft EULA"))
+                    .child(
+                        div()
+                            .text_color(rgb(0xD3D8E2))
+                            .child("Minecraft server software is subject to the official Minecraft EULA. MineDock needs your explicit agreement before it can download or provision server software."),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0x91A0B7))
+                            .child(format!("Official EULA: {OFFICIAL_EULA_URL}")),
+                    )
+                    .child(button(
+                        "View official EULA",
+                        rgb(0x34415C),
+                        true,
+                        cx.listener(Self::open_eula_link),
+                    ))
+                    .when_some(self.eula_error.clone(), |element, error| {
+                        element.child(div().text_color(rgb(0xFF9B9B)).child(error))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(10.))
+                            .child(button(
+                                "Cancel",
+                                rgb(0x303744),
+                                true,
+                                cx.listener(Self::cancel_eula),
+                            ))
+                            .child(button(
+                                "I Agree",
+                                rgb(0x3D5A88),
+                                true,
+                                cx.listener(Self::accept_eula),
+                            )),
+                    ),
+            )
+    }
 }
 
 impl Render for MineDockView {
@@ -1050,6 +1225,9 @@ impl Render for MineDockView {
         }
         if self.wizard_open {
             content = content.child(self.render_wizard(cx));
+        }
+        if self.eula_open {
+            content = content.child(self.render_eula_dialog(cx));
         }
         content
     }
@@ -1166,7 +1344,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::utf16_range_to_byte_range;
+    use super::{EULA_ACCEPTANCE_FILE, eula_acceptance_path, utf16_range_to_byte_range};
+    use minedock_core::{EulaAcceptanceRepository, FileEulaAcceptanceRepository};
+    use tempfile::TempDir;
 
     #[test]
     fn ime_range_handles_non_ascii_prefixes() {
@@ -1185,5 +1365,40 @@ mod tests {
         assert_eq!(utf16_range_to_byte_range("abc", 90..120), 3..3);
         let reversed = std::ops::Range { start: 5, end: 2 };
         assert_eq!(utf16_range_to_byte_range("abcdef", reversed), 2..5);
+    }
+
+    #[test]
+    fn missing_eula_record_requires_confirmation() {
+        let root = TempDir::new().expect("temporary app data");
+        let repository = FileEulaAcceptanceRepository::new(eula_acceptance_path(root.path()));
+
+        assert!(
+            !repository
+                .is_accepted()
+                .expect("missing record is readable")
+        );
+        assert_eq!(EULA_ACCEPTANCE_FILE, "eula-acceptance.json");
+    }
+
+    #[test]
+    fn only_affirmative_eula_action_persists_acceptance() {
+        let root = TempDir::new().expect("temporary app data");
+        let repository = FileEulaAcceptanceRepository::new(eula_acceptance_path(root.path()));
+
+        assert!(
+            repository
+                .record_explicit_acceptance(false)
+                .expect("cancel is handled")
+                .is_none()
+        );
+        assert!(!repository.is_accepted().expect("cancel has no side effect"));
+
+        assert!(
+            repository
+                .record_explicit_acceptance(true)
+                .expect("affirmative action is persisted")
+                .is_some()
+        );
+        assert!(repository.is_accepted().expect("record is readable"));
     }
 }
