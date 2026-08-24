@@ -1,6 +1,6 @@
 # Security Notes
 
-This document distinguishes controls present in the Phase 0–5 foundations from requirements for later MVP work. The current GPUI does not expose server download/start, so these provider and process controls are not yet an end-to-end user workflow.
+This document distinguishes controls present in the Phase 0–5 foundations from the initial Phase 6 GPUI Start/EULA workflow and the remaining MVP work. The current GPUI can begin provider-backed server preparation from a stopped world; Stop, backups, and networking UX remain open.
 
 ## Defaults
 
@@ -40,7 +40,7 @@ Trusted only after validation:
 - `server.properties` is generated from an allowlist with `online-mode=true`.
 - Launch validation rejects missing or modified provision records, JARs, EULA state, and properties that remove or disable online mode.
 
-The user-facing EULA notice and confirmation dialog are not implemented yet. Phase 6 must connect that explicit action to the existing guarded service before enabling Start.
+The GPUI EULA notice and confirmation dialog now connect the explicit `I Agree` action to the guarded service before enabling Start. Cancel, link-opening failures, and acceptance persistence failures keep provisioning blocked.
 
 ## Implemented download controls
 

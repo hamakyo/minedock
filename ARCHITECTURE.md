@@ -166,13 +166,15 @@ MineDockView (GPUI entity)
 ├─ LifecycleSupervisor<app/native adapters>
 ├─ built-in TemplateCatalog
 ├─ create-world wizard state
+├─ EULA confirmation / pending-start state
+├─ asynchronous Start operation state
 ├─ startup error / Java readiness projection
 └─ AppDataLease for this process lifetime
 ```
 
 At startup the app acquires an exclusive app-data lease, reconciles persisted active lifecycle states to `Failed`, loads the world library, and probes Java off the GPUI event loop. A lease or metadata failure disables mutating actions.
 
-The UI currently issues only create-world commands. Start/Stop, explicit EULA acknowledgement, provisioning, log presentation, and backup commands remain Phase 6+ integration work even though their core/native foundations exist.
+The UI issues create-world commands and now connects Start to explicit EULA acknowledgement, authoritative Vanilla resolution, provisioning, Java readiness, and the existing lifecycle/process adapters. Stop, log presentation, and backup commands remain Phase 6+ integration work even though their core/native foundations exist.
 
 ## 9. Persistence
 

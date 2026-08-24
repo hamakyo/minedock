@@ -19,7 +19,7 @@ MineDock presents durable Worlds rather than server folders. A server process is
 
 ## Current status
 
-Phases 0–5 of the implementation plan now provide the application shell and the core/runtime foundations:
+Phases 0–5 of the implementation plan provide the application shell and core/runtime foundations, with the initial Phase 6 Start/EULA wiring now connected:
 
 - a runnable GPUI 0.2.2 desktop application;
 - a dark World Library with a metadata-only create-world wizard;
@@ -31,7 +31,7 @@ Phases 0–5 of the implementation plan now provide the application shell and th
 - a persisted explicit-EULA-acceptance gate, deterministic `server.properties`, and `online-mode=true` launch validation;
 - a shell-free native Java process adapter with graceful `stop`, bounded escalation, log events, per-world start reservations, and Windows Job Object containment.
 
-The current visible workflow stops after creating and listing metadata-only worlds. World cards show persisted lifecycle state and Java readiness, but **Start/Stop is disabled** until the Phase 6 UI connects authoritative version resolution, the EULA confirmation dialog, provisioning, and lifecycle commands. No real Minecraft JAR download or server launch is performed merely by opening the app or creating a world. Backup and networking UX are also not implemented yet.
+World cards now enable **Start** only for stopped, unreserved worlds. Start checks the persisted EULA acceptance, shows the explicit confirmation dialog when needed, then resolves the authoritative release, checks Java, provisions the world, and launches through the existing lifecycle/process adapter in the background. **Stop**, backups, logs/player UX, and networking UX are not implemented yet. Opening the app or creating a world still does not download a JAR or launch a server.
 
 The target MVP remains the end-to-end scenario in [docs/MVP.md](docs/MVP.md); checklist status is tracked in [PLAN.md](PLAN.md).
 
