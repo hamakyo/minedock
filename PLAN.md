@@ -115,10 +115,12 @@ Exit:
 ## Phase 8 — Backups
 
 - [x] Backup only from safe stopped state initially.
-- [x] Create timestamped local backup.
-- [x] Record metadata, size, and SHA-256 digests.
+- [x] Create a timestamped verified ZIP archive plus sidecar manifest.
+- [x] Record Minecraft version, uncompressed/archive sizes, and per-file/archive SHA-256 digests.
 - [x] Auto-backup on successful shutdown when enabled.
 - [x] Retention policy.
+- [x] Show the per-world backup history with timestamp, reason, version, and archive size.
+- [x] Keep startup reconciliation structural-only; run full archive verification off the GPUI event loop.
 - [x] Guard against path traversal during future restore.
 
 Exit:
@@ -144,8 +146,16 @@ Exit:
 - [x] Process timeout tests.
 - [x] Windows packaging.
 - [x] Basic telemetry-free diagnostics bundle.
+- [x] Include sanitized settings, validated session metadata, bounded log tails, and a pre-share contents summary.
 - [x] README user setup.
 - [ ] Issue #19 clean Windows 11 acceptance evidence.
+
+Issue #16's verified ZIP/manifest contract and the MVP portion of Issue #17
+(automatic/manual backups, count retention, and the per-world history UI) are
+implemented. Issue #18's recovery and diagnostics scope is implemented, but
+the native/integration verification debt listed in docs/SECURITY.md remains
+open; Issue #18 is not marked complete until that debt receives a release
+decision. Age-based retention and restore remain separate backlog work.
 
 The release workflow currently uploads a portable ZIP and SHA-256 sidecar as
 a GitHub Actions artifact. It does not create a GitHub Release. Installer and

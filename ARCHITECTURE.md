@@ -188,7 +188,7 @@ MineDockView (GPUI entity)
 ├─ selected world detail panel
 ├─ bounded recent raw-log cache
 ├─ latest persisted session/activity projection
-├─ backup status and background operation state
+├─ backup status, history, and background operation state
 ├─ startup error / Java readiness projection
 └─ AppDataLease for this process lifetime
 ```
@@ -228,10 +228,14 @@ Session history is stored beneath
 - `server.jsonl` is append-only bounded raw output;
 - `activity.json` is the replayable player projection.
 
-Backups are stored beneath `backups/<world-id>/<backup-id>/` with a
-schema-versioned `manifest.json` and a world-scoped index. The artifact
-selection excludes JARs, caches, runtime leases, logs, temporary files, and
-previous backups.
+Backups are stored beneath `backups/<world-id>/` as
+`<backup-id>.zip` plus `<backup-id>.manifest.json` and a world-scoped
+`index.json`. The schema-versioned manifest records the Minecraft version,
+uncompressed/archive sizes, per-file SHA-256 values, and the completed archive
+SHA-256. The artifact selection excludes JARs, caches, runtime leases, logs,
+temporary files, and previous backups. Startup reconciliation reads only
+manifest and ZIP central-directory structure; full content verification is a
+background-worker operation used by normal backup listing.
 
 ## 10. Error model
 

@@ -1,6 +1,6 @@
 # MVP Definition
 
-> Implementation status: the current build supports the GPUI World Library, built-in template selection, metadata-only world creation/persistence, explicit EULA confirmation, Start/Stop lifecycle wiring, Java path recovery settings, world details, persisted session raw logs, best-effort player activity, LAN endpoint display/copy, stopped-world backups, automatic successful-shutdown backups, telemetry-free diagnostics, and a portable Windows package workflow. The clean Windows 11 acceptance run remains a manual release gate. See [../PLAN.md](../PLAN.md) and [windows-acceptance.md](windows-acceptance.md).
+> Implementation status: the current build supports the GPUI World Library, built-in template selection, metadata-only world creation/persistence, explicit EULA confirmation, Start/Stop lifecycle wiring, Java path recovery settings, world details, persisted session raw logs, best-effort player activity, LAN endpoint display/copy, verified ZIP backups with sidecar manifests and per-world history, automatic successful-shutdown backups, sanitized telemetry-free diagnostics, and a portable Windows package workflow. The clean Windows 11 acceptance run remains a manual release gate. See [../PLAN.md](../PLAN.md) and [windows-acceptance.md](windows-acceptance.md).
 
 ## Goal
 
@@ -47,7 +47,9 @@ A Windows user can install MineDock, create one of three Vanilla Java Edition wo
 - local logs
 - automatic safe shutdown backup
 - schema-versioned session records and replayable player activity
-- backup manifest, digest, retention, and restart-visible status
+- verified ZIP backup artifact, sidecar manifest with Minecraft version and
+  uncompressed/archive sizes, integrity digests, count retention, per-world
+  history, and restart-visible status
 
 ### Networking
 - local address + port display

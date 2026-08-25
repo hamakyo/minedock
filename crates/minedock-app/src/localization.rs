@@ -1,6 +1,8 @@
 use crate::network::LanAddressUnavailableReason;
 use atomic_write_file::AtomicWriteFile;
-use minedock_core::{Difficulty, GameMode, JavaReadiness, JavaUnavailableReason, WorldStatus};
+use minedock_core::{
+    BackupReason, Difficulty, GameMode, JavaReadiness, JavaUnavailableReason, WorldStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -78,6 +80,8 @@ pub enum UiText {
     Playtime,
     LastBackup,
     NoBackups,
+    BackupHistory,
+    NoBackupHistory,
     BackupNow,
     RetryBackup,
     ContinueWithoutBackup,
@@ -320,6 +324,10 @@ impl Language {
             (Self::Japanese, UiText::LastBackup) => "最終バックアップ",
             (Self::English, UiText::NoBackups) => "No local backup has been created yet.",
             (Self::Japanese, UiText::NoBackups) => "ローカルバックアップはまだありません。",
+            (Self::English, UiText::BackupHistory) => "Backup history",
+            (Self::Japanese, UiText::BackupHistory) => "バックアップ履歴",
+            (Self::English, UiText::NoBackupHistory) => "No backup history is available.",
+            (Self::Japanese, UiText::NoBackupHistory) => "バックアップ履歴はありません。",
             (Self::English, UiText::BackupNow) => "BACKUP NOW",
             (Self::Japanese, UiText::BackupNow) => "今すぐバックアップ",
             (Self::English, UiText::RetryBackup) => "RETRY BACKUP",
@@ -553,6 +561,17 @@ impl Language {
             (Self::Japanese, Difficulty::Normal) => "ノーマル",
             (Self::English, Difficulty::Hard) => "Hard",
             (Self::Japanese, Difficulty::Hard) => "ハード",
+        }
+    }
+
+    pub fn backup_reason(self, reason: BackupReason) -> &'static str {
+        match (self, reason) {
+            (Self::English, BackupReason::Shutdown) => "shutdown",
+            (Self::Japanese, BackupReason::Shutdown) => "シャットダウン",
+            (Self::English, BackupReason::Manual) => "manual",
+            (Self::Japanese, BackupReason::Manual) => "手動",
+            (Self::English, BackupReason::PreUpgrade) => "pre-upgrade",
+            (Self::Japanese, BackupReason::PreUpgrade) => "アップグレード前",
         }
     }
 }

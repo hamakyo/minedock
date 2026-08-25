@@ -21,8 +21,10 @@ completed and its evidence is recorded.
 8. Copy the address and join from a second LAN device.
 9. Confirm a player join appears in the persisted session activity.
 10. Stop gracefully and wait for the automatic backup to complete.
-11. Confirm the world reaches Stopped and a backup manifest contains the save
-    but not the JAR, cache, raw logs, or temporary files.
+11. Confirm the world reaches Stopped and a verified ZIP backup plus sidecar
+    manifest contains the save but not the JAR, cache, raw logs, or temporary
+    files. Confirm the detail view lists its timestamp, shutdown reason,
+    Minecraft version, and archive size.
 12. Relaunch MineDock and confirm the world, latest session log, player
     activity, and backup remain visible.
 13. Exercise a Java-missing start, invalid Java path, no-LAN-address, and

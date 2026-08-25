@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
-pub const BACKUP_SCHEMA_VERSION: u16 = 1;
+pub const BACKUP_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -35,6 +35,7 @@ impl std::fmt::Display for BackupId {
 pub enum BackupReason {
     Shutdown,
     Manual,
+    PreUpgrade,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,8 +66,11 @@ pub struct BackupManifest {
     pub world_id: WorldId,
     pub created_at: DateTime<Utc>,
     pub reason: BackupReason,
+    pub minecraft_version: String,
     pub files: Vec<BackupFileEntry>,
     pub total_bytes: u64,
+    pub archive_bytes: u64,
+    pub archive_sha256: String,
 }
 
 impl BackupManifest {
@@ -74,6 +78,11 @@ impl BackupManifest {
         if self.schema_version != BACKUP_SCHEMA_VERSION {
             return Err(MineDockError::Backup(
                 "unsupported backup manifest schema version".into(),
+            ));
+        }
+        if self.minecraft_version.trim().is_empty() {
+            return Err(MineDockError::Backup(
+                "backup manifest is missing the Minecraft version".into(),
             ));
         }
         let mut total = 0_u64;
@@ -84,6 +93,18 @@ impl BackupManifest {
         if total != self.total_bytes {
             return Err(MineDockError::Backup(
                 "backup manifest total does not match its files".into(),
+            ));
+        }
+        if self.archive_bytes == 0 {
+            return Err(MineDockError::Backup(
+                "backup manifest archive size must be greater than zero".into(),
+            ));
+        }
+        if self.archive_sha256.len() != 64
+            || !self.archive_sha256.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(MineDockError::Backup(
+                "backup manifest contains an invalid archive SHA-256 digest".into(),
             ));
         }
         Ok(())
@@ -171,8 +192,11 @@ mod tests {
             world_id: WorldId::new(),
             created_at: Utc::now(),
             reason: BackupReason::Manual,
+            minecraft_version: "1.21.5".into(),
             files: vec![entry],
             total_bytes: 3,
+            archive_bytes: 1,
+            archive_sha256: "0".repeat(64),
         };
         assert!(manifest.validate().is_ok());
         assert!(validate_relative_file("../escape").is_err());

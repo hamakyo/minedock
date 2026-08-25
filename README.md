@@ -37,10 +37,13 @@ Windows package. Native clean-machine acceptance remains a manual release gate:
   world, with startup reconciliation for unfinished sessions;
 - best-effort Vanilla server-ready/join/leave/death parsing with persisted
   player activity and playtime projections;
-- stopped-world backups with manifest digests, atomic publication, retention,
-  symlink/reparse-point checks, and automatic backup after a successful
-  graceful shutdown;
-- telemetry-free sanitized diagnostics and owned temporary-download cleanup;
+- stopped-world verified ZIP backups with sidecar manifests containing the
+  Minecraft version, uncompressed/archive sizes, per-file and archive SHA-256
+  digests, atomic publication, retention, symlink/reparse-point checks, and
+  automatic backup after a successful graceful shutdown;
+- telemetry-free diagnostics with sanitized settings, validated session
+  metadata, bounded recent log tails, a contents summary, and owned
+  temporary-download cleanup;
 - a locked portable Windows ZIP workflow in
   [packaging/package-windows.ps1](packaging/package-windows.ps1), with a
   SHA-256 sidecar.
@@ -50,8 +53,8 @@ Windows package. Native clean-machine acceptance remains a manual release gate:
 
 World cards enable **Start** only for stopped, unreserved worlds and expose
 graceful **Stop** controls for running worlds. The detail view reloads the
-latest persisted session logs, player activity, and backup metadata after an
-app restart. A successful graceful stop enters **Backing Up** when the
+latest persisted session logs, player activity, and per-world backup history
+after an app restart. A successful graceful stop enters **Backing Up** when the
 world's policy enables shutdown backups; timeout, force-stop, and unexpected
 exit paths never claim a safe backup. Opening the app or creating a world still
 does not download a JAR or launch a server.
