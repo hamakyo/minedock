@@ -1,6 +1,10 @@
 # MineDock Implementation Plan
 
-Checklist status reflects code and tests in the repository, not the final MVP acceptance scenario. Phases 0–5 have implementation foundations, and the Phase 6 library now includes Java recovery settings, world details, and a current-session recent-log view. Player events, backups, and the remaining MVP acceptance work are still open.
+Checklist status reflects code and tests in the repository, not the final MVP
+acceptance scenario. The implementation now includes persisted session logs,
+best-effort player activity, safe backups, telemetry-free diagnostics, and a
+portable Windows package workflow. The native Windows acceptance scenario is
+still a manual release gate.
 
 ## Phase 0 — Stabilize scaffold
 
@@ -88,9 +92,9 @@ Exit:
 - [x] Start action: resolve, provision, and launch through the lifecycle runtime.
 - [x] Stop action.
 - [x] Lifecycle indicators.
-- [ ] Player count if known.
+- [x] Player count if known.
 - [x] World detail panel.
-- [x] Recent raw logs for the current server session.
+- [x] Recent raw logs for the current and latest persisted server session.
 - [x] Disable invalid actions according to state.
 
 Exit:
@@ -98,24 +102,24 @@ Exit:
 
 ## Phase 7 — Log parser + player events
 
-- [ ] Raw logs first.
-- [ ] Parse join/leave.
-- [ ] Parse common death messages best-effort.
-- [ ] Session record.
-- [ ] Total playtime accounting.
-- [ ] Do not depend on death parsing for critical state.
+- [x] Raw logs first.
+- [x] Parse join/leave.
+- [x] Parse common death messages best-effort.
+- [x] Session record.
+- [x] Total playtime accounting.
+- [x] Do not depend on death parsing for critical state.
 
 Exit:
 - Useful live world/session information appears in UI.
 
 ## Phase 8 — Backups
 
-- [ ] Backup only from safe stopped state initially.
-- [ ] Create timestamped local backup.
-- [ ] Record metadata and size.
-- [ ] Auto-backup on successful shutdown when enabled.
-- [ ] Retention policy.
-- [ ] Guard against path traversal during future restore.
+- [x] Backup only from safe stopped state initially.
+- [x] Create timestamped local backup.
+- [x] Record metadata, size, and SHA-256 digests.
+- [x] Auto-backup on successful shutdown when enabled.
+- [x] Retention policy.
+- [x] Guard against path traversal during future restore.
 
 Exit:
 - A stopped world is automatically recoverable from local backup artifacts.
@@ -126,20 +130,20 @@ Exit:
 - [x] Show usable LAN IPv4 address(es) without guessing when candidates are ambiguous.
 - [x] Copy connection address.
 - [x] Show basic no-address and invalid-configured-port diagnostics.
-- [ ] Document direct internet hosting without silently changing router/firewall.
+- [x] Document direct internet hosting without silently changing router/firewall.
 
 Exit:
 - Friends on the same network can connect with minimal friction.
 
 ## Phase 10 — MVP hardening
 
-- [ ] Crash recovery.
+- [x] Crash recovery.
 - [x] Corrupt metadata handling.
-- [ ] Partial download recovery.
-- [ ] Disk space checks.
+- [x] Partial download recovery.
+- [x] Disk space checks.
 - [x] Process timeout tests.
-- [ ] Windows packaging.
-- [ ] Basic telemetry-free diagnostics bundle.
+- [x] Windows packaging.
+- [x] Basic telemetry-free diagnostics bundle.
 - [x] README user setup.
 
 ## Post-MVP backlog

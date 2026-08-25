@@ -8,10 +8,12 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 atomic-write-file.workspace = true
+chrono.workspace = true
 gpui.workspace = true
 minedock-core = { path = "../minedock-core" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 ureq.workspace = true
 windows-sys.workspace = true
 

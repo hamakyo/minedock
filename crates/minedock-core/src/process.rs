@@ -231,6 +231,12 @@ impl SessionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn parse(value: impl AsRef<str>) -> Result<Self> {
+        Uuid::parse_str(value.as_ref())
+            .map(Self)
+            .map_err(|error| MineDockError::Persistence(format!("invalid session id: {error}")))
+    }
 }
 
 impl Default for SessionId {
@@ -245,7 +251,8 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LogStream {
     Stdout,
     Stderr,
@@ -811,6 +818,16 @@ where
         world_id: WorldId,
         token: StopEscalationToken,
     ) -> Result<ProcessExit> {
+        self.force_terminate_with_events(world_id, token, 0)
+            .map(|(exit, _events)| exit)
+    }
+
+    pub fn force_terminate_with_events(
+        &mut self,
+        world_id: WorldId,
+        token: StopEscalationToken,
+        max_raw: usize,
+    ) -> Result<(ProcessExit, Vec<ServerEvent>)> {
         let session = self
             .sessions
             .get_mut(&world_id)
@@ -828,10 +845,15 @@ where
             ));
         }
         let exit = session.process.force_terminate(token)?;
+        let events = if max_raw == 0 {
+            Vec::new()
+        } else {
+            drain_all_process_events(&session.process, max_raw)
+        };
         self.persistence
             .persist_session(world_id, WorldStatus::Failed, None, None)?;
         self.sessions.remove(&world_id);
-        Ok(exit)
+        Ok((exit, events))
     }
 
     pub fn poll_exit(&mut self, world_id: WorldId) -> Result<Option<ProcessExit>> {

@@ -3181,10 +3181,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "atomic-write-file",
+ "chrono",
  "gpui",
  "minedock-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "ureq",
  "windows-sys 0.61.2",
