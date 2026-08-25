@@ -774,7 +774,9 @@ where
                 let events = max_raw.map_or_else(Vec::new, |limit| {
                     self.sessions
                         .get(&world_id)
-                        .map_or_else(Vec::new, |session| session.process.drain_events(limit))
+                        .map_or_else(Vec::new, |session| {
+                            drain_all_process_events(&session.process, limit)
+                        })
                 });
                 self.persistence
                     .persist_session(world_id, target, None, None)?;
@@ -1258,6 +1260,43 @@ mod tests {
                 ServerEvent::Raw(RawLogLine { line, .. }) if line == "server stopped cleanly"
             )
         }));
+        assert_eq!(supervisor.session_id(world_id), None);
+        assert_eq!(
+            supervisor.persistence().status(world_id),
+            Some(WorldStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn stop_with_events_drains_all_final_output_before_session_removal() {
+        let world_id = WorldId::new();
+        let mut supervisor = LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            FinalEventFactory {
+                unexpected_exit: true,
+            },
+            TestLeaseProvider,
+        );
+        supervisor
+            .start(Path::new("."), world_id, || Ok(test_spec(world_id)))
+            .expect("start");
+
+        let (outcome, events) = supervisor
+            .stop_with_events(world_id, Duration::from_millis(1), 64)
+            .expect("stop with events");
+        assert!(matches!(
+            outcome,
+            Some(StopOutcome::Exited { exit }) if exit.success
+        ));
+        assert!(events.len() > 64);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(RawLogLine { line, .. }) if line == "unexpected final stdout"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(RawLogLine { line, .. }) if line == "unexpected final stderr"
+        )));
         assert_eq!(supervisor.session_id(world_id), None);
         assert_eq!(
             supervisor.persistence().status(world_id),
