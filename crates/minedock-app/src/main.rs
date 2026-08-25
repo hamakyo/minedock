@@ -44,8 +44,11 @@ type AppLifecycle = LifecycleSupervisor<
 >;
 type LifecyclePollResult = (WorldId, minedock_core::Result<Option<ProcessExit>>);
 type LifecyclePollResults = Vec<LifecyclePollResult>;
-type LifecycleEventResult = (WorldId, minedock_core::Result<Vec<ServerEvent>>);
-type LifecycleEventResults = Vec<LifecycleEventResult>;
+type LifecyclePollEventResult = (
+    WorldId,
+    minedock_core::Result<(Option<ProcessExit>, Vec<ServerEvent>)>,
+);
+type LifecyclePollEventResults = Vec<LifecyclePollEventResult>;
 type LifecycleStopEventResult = minedock_core::Result<(Option<StopOutcome>, Vec<ServerEvent>)>;
 type LifecycleStopEventBatch<P, F, L> = (LifecycleSupervisor<P, F, L>, LifecycleStopEventResult);
 
@@ -315,35 +318,20 @@ where
 fn execute_lifecycle_poll_and_drain<P, F, L>(
     mut lifecycle: LifecycleSupervisor<P, F, L>,
     world_ids: impl IntoIterator<Item = WorldId>,
-) -> (
-    LifecycleSupervisor<P, F, L>,
-    LifecyclePollResults,
-    LifecycleEventResults,
-)
+) -> (LifecycleSupervisor<P, F, L>, LifecyclePollEventResults)
 where
     P: minedock_core::LifecyclePersistence,
     F: minedock_core::ProcessFactory,
     L: minedock_core::LifecycleLeaseProvider,
 {
-    let world_ids: Vec<_> = world_ids.into_iter().collect();
-    // Drain before polling. poll_exit removes an exited session from the
-    // supervisor, while the final output still belongs in the detail panel.
-    let events = world_ids
-        .iter()
-        .copied()
-        .map(|world_id| {
-            let result = lifecycle.drain_events(world_id, 64);
-            (world_id, result)
-        })
-        .collect();
     let results = world_ids
         .into_iter()
         .map(|world_id| {
-            let result = lifecycle.poll_exit(world_id);
+            let result = lifecycle.poll_exit_with_events(world_id, 64);
             (world_id, result)
         })
         .collect();
-    (lifecycle, results, events)
+    (lifecycle, results)
 }
 
 actions!(
@@ -1488,50 +1476,47 @@ impl MineDockView {
             .background_executor()
             .spawn(async move { execute_lifecycle_poll_and_drain(lifecycle, world_ids) });
         cx.spawn(async move |this, cx| {
-            let (lifecycle, results, event_results) = worker.await;
+            let (lifecycle, results) = worker.await;
             let _ = this.update(cx, |view, cx| {
                 view._lifecycle = Some(lifecycle);
                 let mut errors = Vec::new();
                 let mut should_reload = false;
                 let mut late_stop_completed = false;
                 let mut pending_force_stop_is_active = false;
-                for (world_id, result) in event_results {
-                    match result {
-                        Ok(events) => view.record_server_events(world_id, events),
-                        Err(error) => errors.push(format!(
-                            "Could not read recent logs for world {world_id}: {error}"
-                        )),
-                    }
-                }
                 let pending_force_stop_world = view
                     .pending_force_stop
                     .as_ref()
                     .map(|(world_id, _)| *world_id);
                 for (world_id, result) in results {
                     match result {
-                        Ok(Some(exit)) => {
-                            should_reload = true;
-                            view.status_overrides.remove(&world_id);
-                            if pending_force_stop_world == Some(world_id) {
-                                view.pending_force_stop = None;
-                                if exit.success {
-                                    late_stop_completed = true;
-                                } else {
-                                    errors.push(format!(
-                                        "World process exited after graceful stop timed out (code {:?}); it was marked Failed.",
-                                        exit.code
-                                    ));
+                        Ok((exit, events)) => {
+                            view.record_server_events(world_id, events);
+                            match exit {
+                                Some(exit) => {
+                                    should_reload = true;
+                                    view.status_overrides.remove(&world_id);
+                                    if pending_force_stop_world == Some(world_id) {
+                                        view.pending_force_stop = None;
+                                        if exit.success {
+                                            late_stop_completed = true;
+                                        } else {
+                                            errors.push(format!(
+                                                "World process exited after graceful stop timed out (code {:?}); it was marked Failed.",
+                                                exit.code
+                                            ));
+                                        }
+                                    } else {
+                                        errors.push(format!(
+                                            "World process exited unexpectedly (code {:?}; success={}); it was marked Failed.",
+                                            exit.code, exit.success
+                                        ));
+                                    }
                                 }
-                            } else {
-                                errors.push(format!(
-                                    "World process exited unexpectedly (code {:?}; success={}); it was marked Failed.",
-                                    exit.code, exit.success
-                                ));
-                            }
-                        }
-                        Ok(None) => {
-                            if pending_force_stop_world == Some(world_id) {
-                                pending_force_stop_is_active = true;
+                                None => {
+                                    if pending_force_stop_world == Some(world_id) {
+                                        pending_force_stop_is_active = true;
+                                    }
+                                }
                             }
                         }
                         Err(error) => {
@@ -3088,9 +3073,9 @@ mod tests {
     use super::{
         EULA_ACCEPTANCE_FILE, JavaPathInputError, LifecycleOperation, RecentLogLine,
         clear_recent_logs_for_new_session, eula_acceptance_path, eula_requires_confirmation,
-        execute_lifecycle_force_stop, execute_lifecycle_poll, execute_lifecycle_start,
-        execute_lifecycle_stop, parse_java_path_input, poll_exit_allowed, select_java_runtime,
-        start_allowed, stop_allowed, utf16_range_to_byte_range,
+        execute_lifecycle_force_stop, execute_lifecycle_poll, execute_lifecycle_poll_and_drain,
+        execute_lifecycle_start, execute_lifecycle_stop, parse_java_path_input, poll_exit_allowed,
+        select_java_runtime, start_allowed, stop_allowed, utf16_range_to_byte_range,
     };
     use minedock_core::{
         EulaAcceptanceRepository, FileEulaAcceptanceRepository, GracefulStopResult,
@@ -3099,6 +3084,7 @@ mod tests {
         ServerEvent, ServerProcess, SessionId, StopEscalationToken, ValidatedServerCommand,
         WorldId, WorldStatus,
     };
+    use std::cell::Cell;
     use std::collections::{HashMap, VecDeque};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -3125,6 +3111,8 @@ mod tests {
         stop_times_out: bool,
         exits_on_poll: bool,
         poll_exit_success: bool,
+        emit_final_events: bool,
+        final_events_ready: Cell<bool>,
     }
 
     impl ServerProcess for TestProcess {
@@ -3177,7 +3165,7 @@ mod tests {
         }
 
         fn try_wait(&mut self) -> minedock_core::Result<Option<ProcessExit>> {
-            Ok(self.exits_on_poll.then_some(if self.poll_exit_success {
+            let result = self.exits_on_poll.then_some(if self.poll_exit_success {
                 ProcessExit {
                     code: Some(0),
                     success: true,
@@ -3187,11 +3175,34 @@ mod tests {
                     code: Some(1),
                     success: false,
                 }
-            }))
+            });
+            if result.is_some() {
+                self.final_events_ready.set(true);
+            }
+            Ok(result)
         }
 
         fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
-            Vec::new()
+            if self.emit_final_events && self.final_events_ready.get() {
+                vec![
+                    ServerEvent::Raw(minedock_core::RawLogLine {
+                        world_id: self.world_id,
+                        session_id: self.session_id,
+                        stream: minedock_core::LogStream::Stdout,
+                        line: "unexpected final stdout".into(),
+                        truncated: false,
+                    }),
+                    ServerEvent::Raw(minedock_core::RawLogLine {
+                        world_id: self.world_id,
+                        session_id: self.session_id,
+                        stream: minedock_core::LogStream::Stderr,
+                        line: "unexpected final stderr".into(),
+                        truncated: false,
+                    }),
+                ]
+            } else {
+                Vec::new()
+            }
         }
     }
 
@@ -3200,6 +3211,7 @@ mod tests {
         stop_times_out: bool,
         exits_on_poll: bool,
         poll_exit_success: bool,
+        emit_final_events: bool,
     }
 
     impl ProcessFactory for TestProcessFactory {
@@ -3216,6 +3228,8 @@ mod tests {
                 stop_times_out: self.stop_times_out,
                 exits_on_poll: self.exits_on_poll,
                 poll_exit_success: self.poll_exit_success,
+                emit_final_events: self.emit_final_events,
+                final_events_ready: Cell::new(false),
             })
         }
     }
@@ -3479,6 +3493,7 @@ mod tests {
                 stop_times_out: true,
                 exits_on_poll: false,
                 poll_exit_success: false,
+                emit_final_events: false,
             },
             TestLeaseProvider,
         );
@@ -3518,6 +3533,7 @@ mod tests {
                 stop_times_out: true,
                 exits_on_poll: true,
                 poll_exit_success: true,
+                emit_final_events: false,
             },
             TestLeaseProvider,
         );
@@ -3560,6 +3576,7 @@ mod tests {
                 stop_times_out: false,
                 exits_on_poll: true,
                 poll_exit_success: false,
+                emit_final_events: false,
             },
             TestLeaseProvider,
         );
@@ -3574,6 +3591,47 @@ mod tests {
             results.as_slice(),
             [(id, Ok(Some(ProcessExit { success: false, .. })))] if *id == world_id
         ));
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::Failed)
+        );
+        assert!(lifecycle.session_id(world_id).is_none());
+    }
+
+    #[test]
+    fn polling_unexpected_exit_keeps_final_events_before_session_removal() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory {
+                stop_times_out: false,
+                exits_on_poll: true,
+                poll_exit_success: false,
+                emit_final_events: true,
+            },
+            TestLeaseProvider,
+        );
+        let (lifecycle, started) =
+            execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+                Ok(test_launch_spec(world_id))
+            });
+        assert!(started.is_ok());
+
+        let (lifecycle, results) = execute_lifecycle_poll_and_drain(lifecycle, [world_id]);
+        let (_, result) = results.into_iter().next().expect("poll result");
+        let (exit, events) = result.expect("poll with events");
+        assert!(matches!(exit, Some(ProcessExit { success: false, .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(minedock_core::RawLogLine { line, .. })
+                if line == "unexpected final stdout"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(minedock_core::RawLogLine { line, .. })
+                if line == "unexpected final stderr"
+        )));
         assert_eq!(
             lifecycle.persistence().status(world_id),
             Some(WorldStatus::Failed)

@@ -833,15 +833,38 @@ where
     }
 
     pub fn poll_exit(&mut self, world_id: WorldId) -> Result<Option<ProcessExit>> {
-        let (exit, stopping) = {
+        self.poll_exit_inner(world_id, None)
+            .map(|(exit, _events)| exit)
+    }
+
+    /// Poll a world and collect process events before removing an exited
+    /// session. Native adapters synchronize their output readers from
+    /// `try_wait`, so events emitted immediately before an unexpected exit
+    /// remain available to the caller.
+    pub fn poll_exit_with_events(
+        &mut self,
+        world_id: WorldId,
+        max_raw: usize,
+    ) -> Result<(Option<ProcessExit>, Vec<ServerEvent>)> {
+        self.poll_exit_inner(world_id, Some(max_raw))
+    }
+
+    fn poll_exit_inner(
+        &mut self,
+        world_id: WorldId,
+        max_raw: Option<usize>,
+    ) -> Result<(Option<ProcessExit>, Vec<ServerEvent>)> {
+        let (exit, stopping, events) = {
             let session = self
                 .sessions
                 .get_mut(&world_id)
                 .ok_or_else(|| MineDockError::InvalidState("world has no active session".into()))?;
-            let Some(exit) = session.process.try_wait()? else {
-                return Ok(None);
-            };
-            (exit, session.status == WorldStatus::Stopping)
+            let exit = session.process.try_wait()?;
+            let events = max_raw.map_or_else(Vec::new, |limit| session.process.drain_events(limit));
+            (exit, session.status == WorldStatus::Stopping, events)
+        };
+        let Some(exit) = exit else {
+            return Ok((None, events));
         };
         let target = if stopping && exit.success {
             WorldStatus::Stopped
@@ -851,7 +874,7 @@ where
         self.persistence
             .persist_session(world_id, target, None, None)?;
         self.sessions.remove(&world_id);
-        Ok(Some(exit))
+        Ok((Some(exit), events))
     }
 
     pub fn session_id(&self, world_id: WorldId) -> Option<SessionId> {
@@ -1012,12 +1035,15 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct FinalEventFactory;
+    struct FinalEventFactory {
+        unexpected_exit: bool,
+    }
 
     #[derive(Debug)]
     struct FinalEventProcess {
         world_id: WorldId,
         session_id: SessionId,
+        unexpected_exit: bool,
     }
 
     impl ServerProcess for FinalEventProcess {
@@ -1061,17 +1087,43 @@ mod tests {
         }
 
         fn try_wait(&mut self) -> Result<Option<ProcessExit>> {
-            Ok(None)
+            if self.unexpected_exit {
+                Ok(Some(ProcessExit {
+                    code: Some(1),
+                    success: false,
+                }))
+            } else {
+                Ok(None)
+            }
         }
 
         fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
-            vec![ServerEvent::Raw(RawLogLine {
-                world_id: self.world_id,
-                session_id: self.session_id,
-                stream: LogStream::Stdout,
-                line: "server stopped cleanly".into(),
-                truncated: false,
-            })]
+            if self.unexpected_exit {
+                vec![
+                    ServerEvent::Raw(RawLogLine {
+                        world_id: self.world_id,
+                        session_id: self.session_id,
+                        stream: LogStream::Stdout,
+                        line: "unexpected final stdout".into(),
+                        truncated: false,
+                    }),
+                    ServerEvent::Raw(RawLogLine {
+                        world_id: self.world_id,
+                        session_id: self.session_id,
+                        stream: LogStream::Stderr,
+                        line: "unexpected final stderr".into(),
+                        truncated: false,
+                    }),
+                ]
+            } else {
+                vec![ServerEvent::Raw(RawLogLine {
+                    world_id: self.world_id,
+                    session_id: self.session_id,
+                    stream: LogStream::Stdout,
+                    line: "server stopped cleanly".into(),
+                    truncated: false,
+                })]
+            }
         }
     }
 
@@ -1082,6 +1134,7 @@ mod tests {
             Ok(FinalEventProcess {
                 world_id: spec.world_id,
                 session_id,
+                unexpected_exit: self.unexpected_exit,
             })
         }
     }
@@ -1148,7 +1201,7 @@ mod tests {
         let world_id = WorldId::new();
         let mut supervisor = LifecycleSupervisor::new(
             InMemoryLifecyclePersistence::default(),
-            FinalEventFactory,
+            FinalEventFactory::default(),
             TestLeaseProvider,
         );
         supervisor
@@ -1172,6 +1225,39 @@ mod tests {
         assert_eq!(
             supervisor.persistence().status(world_id),
             Some(WorldStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn poll_exit_with_events_collects_unexpected_final_output_before_session_removal() {
+        let world_id = WorldId::new();
+        let mut supervisor = LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            FinalEventFactory {
+                unexpected_exit: true,
+            },
+            TestLeaseProvider,
+        );
+        supervisor
+            .start(Path::new("."), world_id, || Ok(test_spec(world_id)))
+            .expect("start");
+
+        let (exit, events) = supervisor
+            .poll_exit_with_events(world_id, 64)
+            .expect("poll with events");
+        assert!(matches!(exit, Some(ProcessExit { success: false, .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(RawLogLine { line, .. }) if line == "unexpected final stdout"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(RawLogLine { line, .. }) if line == "unexpected final stderr"
+        )));
+        assert_eq!(supervisor.session_id(world_id), None);
+        assert_eq!(
+            supervisor.persistence().status(world_id),
+            Some(WorldStatus::Failed)
         );
     }
 

@@ -540,6 +540,48 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_exit_fixture_preserves_final_stdout_and_stderr() {
+        let root = std::env::temp_dir().join(format!(
+            "minedock-native-process-unexpected-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("fixture root");
+        let spec = LaunchSpec {
+            executable: std::env::current_exe().expect("test executable"),
+            args: vec![
+                "--exact".into(),
+                "native_process::tests::unexpected_exit_fixture_child".into(),
+                "--nocapture".into(),
+            ],
+            current_dir: root.clone(),
+            world_id: WorldId::new(),
+        };
+        let mut process = NativeServerProcess::spawn_without_job_for_test(&spec, SessionId::new())
+            .expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let exit = loop {
+            if let Some(exit) = process.try_wait().expect("poll") {
+                break exit;
+            }
+            assert!(Instant::now() < deadline, "fixture did not exit in time");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(exit.success);
+        let events = process.drain_events(64);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(RawLogLine { line, .. })
+                if line == "fixture unexpected final stdout"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(RawLogLine { line, .. })
+                if line == "fixture unexpected final stderr"
+        )));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn fixture_child() {
         if !std::env::args().any(|argument| argument == "--exact") {
             return;
@@ -553,6 +595,15 @@ mod tests {
         assert_eq!(input, "stop\n");
         println!("fixture final stdout");
         eprintln!("fixture final stderr");
+    }
+
+    #[test]
+    fn unexpected_exit_fixture_child() {
+        if !std::env::args().any(|argument| argument == "--exact") {
+            return;
+        }
+        println!("fixture unexpected final stdout");
+        eprintln!("fixture unexpected final stderr");
     }
 
     #[test]
