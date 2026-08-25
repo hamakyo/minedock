@@ -1,7 +1,7 @@
 use crate::minecraft::generate_server_properties;
 use crate::{
     MineDockError, MinecraftEdition, MinecraftVersionId, MinecraftVersionSelector, Result,
-    ServerDistribution, World,
+    ServerDistribution, World, WorldId, WorldStatus,
 };
 use atomic_write_file::AtomicWriteFile;
 use chrono::{DateTime, Utc};
@@ -22,6 +22,8 @@ pub const MAX_REDIRECT_HOPS: usize = 8;
 pub const EULA_RECORD_SCHEMA_VERSION: u16 = 1;
 pub const PROVISION_RECORD_SCHEMA_VERSION: u16 = 1;
 const INCOMPLETE_PROVISION_MARKER: &str = ".minedock-provision.incomplete";
+const LIFECYCLE_SESSION_FILE: &str = "session.json";
+const LIFECYCLE_SESSION_SCHEMA_VERSION: u16 = 1;
 
 const METADATA_AUTHORITIES: &[&str] = &["piston-meta.mojang.com", "launchermeta.mojang.com"];
 const ARTIFACT_AUTHORITIES: &[&str] = &["piston-data.mojang.com", "launcher.mojang.com"];
@@ -308,6 +310,19 @@ struct IncompleteProvision {
     schema_version: u16,
     world_id: crate::WorldId,
     record: ProvisionRecord,
+}
+
+/// The app lifecycle adapter writes this record before the background
+/// preparation step starts. It is therefore an owned file that can
+/// legitimately exist in an otherwise unprovisioned world directory.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleSessionRecord {
+    schema_version: u16,
+    world_id: WorldId,
+    session_id: Option<String>,
+    status: WorldStatus,
+    pid: Option<u32>,
 }
 
 impl ProvisionRecord {
@@ -911,7 +926,7 @@ impl<T: AuthoritativeTransport, S: PathSafety> VanillaProvider<T, S> {
                 // fails before any launchable files are written. A later
                 // retry may complete the deterministic properties attestation.
                 if !provision_path.exists() && !incomplete_marker.exists() {
-                    reject_unknown_world_content(&world_root)?;
+                    reject_unknown_world_content(&world_root, world.id)?;
                     let marker = IncompleteProvision {
                         schema_version: PROVISION_RECORD_SCHEMA_VERSION,
                         world_id: world.id,
@@ -941,9 +956,9 @@ impl<T: AuthoritativeTransport, S: PathSafety> VanillaProvider<T, S> {
             }
         } else if incomplete_marker.exists() {
             repair_incomplete_provision(&incomplete_marker, &world_root, &record)?;
-            reject_unknown_world_content(&world_root)?;
+            reject_unknown_world_content(&world_root, world.id)?;
         } else {
-            reject_unknown_world_content(&world_root)?;
+            reject_unknown_world_content(&world_root, world.id)?;
         }
         if !provision_path.exists() {
             let marker = IncompleteProvision {
@@ -1324,24 +1339,77 @@ fn rooted_record_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn reject_unknown_world_content(root: &Path) -> Result<()> {
+fn reject_unknown_world_content(root: &Path, world_id: WorldId) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
     let metadata = fs::symlink_metadata(root)
         .map_err(|error| MineDockError::Persistence(error.to_string()))?;
-    if !metadata.is_dir()
-        || fs::read_dir(root)
-            .map_err(|error| MineDockError::Persistence(error.to_string()))?
-            .filter_map(std::result::Result::ok)
-            .any(|entry| entry.file_name() != INCOMPLETE_PROVISION_MARKER)
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(unknown_world_content_error());
+    }
+    for entry in
+        fs::read_dir(root).map_err(|error| MineDockError::Persistence(error.to_string()))?
     {
-        return Err(MineDockError::Persistence(
-            "world directory contains unknown user content without a MineDock provision record"
-                .into(),
-        ));
+        let entry = entry.map_err(|error| MineDockError::Persistence(error.to_string()))?;
+        match entry.file_name().to_str() {
+            Some(INCOMPLETE_PROVISION_MARKER) => {}
+            Some("server") => validate_lifecycle_session_dir(&entry.path(), world_id)?,
+            _ => return Err(unknown_world_content_error()),
+        }
     }
     Ok(())
+}
+
+fn validate_lifecycle_session_dir(server_dir: &Path, world_id: WorldId) -> Result<()> {
+    let metadata = fs::symlink_metadata(server_dir)
+        .map_err(|error| MineDockError::Persistence(error.to_string()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(unknown_world_content_error());
+    }
+    let mut entries =
+        fs::read_dir(server_dir).map_err(|error| MineDockError::Persistence(error.to_string()))?;
+    let Some(entry) = entries
+        .next()
+        .transpose()
+        .map_err(|error| MineDockError::Persistence(error.to_string()))?
+    else {
+        return Err(unknown_world_content_error());
+    };
+    if entry.file_name() != LIFECYCLE_SESSION_FILE
+        || entries
+            .next()
+            .transpose()
+            .map_err(|error| MineDockError::Persistence(error.to_string()))?
+            .is_some()
+    {
+        return Err(unknown_world_content_error());
+    }
+    let session_path = entry.path();
+    let metadata = fs::symlink_metadata(&session_path)
+        .map_err(|error| MineDockError::Persistence(error.to_string()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(unknown_world_content_error());
+    }
+    let bytes =
+        fs::read(&session_path).map_err(|error| MineDockError::Persistence(error.to_string()))?;
+    let record: LifecycleSessionRecord =
+        serde_json::from_slice(&bytes).map_err(|_| unknown_world_content_error())?;
+    if record.schema_version != LIFECYCLE_SESSION_SCHEMA_VERSION
+        || record.world_id != world_id
+        || record.status != WorldStatus::Preparing
+        || record.session_id.is_some()
+        || record.pid.is_some()
+    {
+        return Err(unknown_world_content_error());
+    }
+    Ok(())
+}
+
+fn unknown_world_content_error() -> MineDockError {
+    MineDockError::Persistence(
+        "world directory contains unknown user content without a MineDock provision record".into(),
+    )
 }
 
 fn portable_reject_path_type(path: &Path, directory: bool) -> Result<()> {
@@ -1938,6 +2006,23 @@ mod tests {
         let eula = FileEulaAcceptanceRepository::new(root.path().join("acceptance.json"));
         eula.record_explicit_acceptance(true)
             .expect("explicit acceptance");
+        // JsonLifecyclePersistence writes this owned record before the app's
+        // background preparation closure runs. Provisioning must preserve it
+        // instead of treating the server directory as user content.
+        let session_path = root
+            .path()
+            .join(&world.data_path)
+            .join("server")
+            .join(LIFECYCLE_SESSION_FILE);
+        fs::create_dir_all(session_path.parent().expect("session parent")).expect("session dir");
+        fs::write(
+            &session_path,
+            format!(
+                r#"{{"schema_version":1,"world_id":"{}","session_id":null,"status":"preparing","pid":null}}"#,
+                world.id
+            ),
+        )
+        .expect("preparation session");
         let provisioned = provider
             .provision_server_at(root.path(), &world, &resolved, &artifact, &eula)
             .expect("provision");
