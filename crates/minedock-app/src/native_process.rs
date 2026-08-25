@@ -499,7 +499,14 @@ mod tests {
             .graceful_stop(Duration::from_secs(5))
             .expect("graceful stop");
         assert!(matches!(result, GracefulStopResult::Exited { exit } if exit.success));
-        let events = process.drain_events(64);
+        let mut events = Vec::new();
+        loop {
+            let batch = process.drain_events(64);
+            if batch.is_empty() {
+                break;
+            }
+            events.extend(batch);
+        }
         let spawned = events.iter().position(|event| {
             matches!(
                 event,
@@ -567,7 +574,15 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
         assert!(exit.success);
-        let events = process.drain_events(64);
+        let mut events = Vec::new();
+        loop {
+            let batch = process.drain_events(64);
+            if batch.is_empty() {
+                break;
+            }
+            events.extend(batch);
+        }
+        assert!(events.len() > 64);
         assert!(events.iter().any(|event| matches!(
             event,
             ServerEvent::Raw(RawLogLine { line, .. })
@@ -601,6 +616,10 @@ mod tests {
     fn unexpected_exit_fixture_child() {
         if !std::env::args().any(|argument| argument == "--exact") {
             return;
+        }
+        for index in 0..70 {
+            println!("fixture unexpected log {index}");
+            eprintln!("fixture unexpected error {index}");
         }
         println!("fixture unexpected final stdout");
         eprintln!("fixture unexpected final stderr");

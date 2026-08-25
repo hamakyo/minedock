@@ -3183,7 +3183,7 @@ mod tests {
         }
 
         fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
-            if self.emit_final_events && self.final_events_ready.get() {
+            if self.emit_final_events && self.final_events_ready.replace(false) {
                 vec![
                     ServerEvent::Raw(minedock_core::RawLogLine {
                         world_id: self.world_id,

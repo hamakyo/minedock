@@ -860,7 +860,13 @@ where
                 .get_mut(&world_id)
                 .ok_or_else(|| MineDockError::InvalidState("world has no active session".into()))?;
             let exit = session.process.try_wait()?;
-            let events = max_raw.map_or_else(Vec::new, |limit| session.process.drain_events(limit));
+            let events = max_raw.map_or_else(Vec::new, |limit| {
+                if exit.is_some() {
+                    drain_all_process_events(&session.process, limit)
+                } else {
+                    session.process.drain_events(limit)
+                }
+            });
             (exit, session.status == WorldStatus::Stopping, events)
         };
         let Some(exit) = exit else {
@@ -891,6 +897,21 @@ where
     }
 }
 
+fn drain_all_process_events<P: ServerProcess>(process: &P, max_raw: usize) -> Vec<ServerEvent> {
+    if max_raw == 0 {
+        return process.drain_events(0);
+    }
+    let mut events = Vec::new();
+    loop {
+        let batch = process.drain_events(max_raw);
+        if batch.is_empty() {
+            break;
+        }
+        events.extend(batch);
+    }
+    events
+}
+
 pub fn validate_process_transition(from: WorldStatus, to: WorldStatus) -> Result<()> {
     if can_transition(from, to) {
         Ok(())
@@ -916,6 +937,7 @@ pub fn recover_persisted_active_states<P: LifecyclePersistence>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::path::Path;
 
     #[derive(Debug, Default)]
@@ -1044,6 +1066,7 @@ mod tests {
         world_id: WorldId,
         session_id: SessionId,
         unexpected_exit: bool,
+        pending_events: RefCell<Vec<ServerEvent>>,
     }
 
     impl ServerProcess for FinalEventProcess {
@@ -1097,33 +1120,10 @@ mod tests {
             }
         }
 
-        fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
-            if self.unexpected_exit {
-                vec![
-                    ServerEvent::Raw(RawLogLine {
-                        world_id: self.world_id,
-                        session_id: self.session_id,
-                        stream: LogStream::Stdout,
-                        line: "unexpected final stdout".into(),
-                        truncated: false,
-                    }),
-                    ServerEvent::Raw(RawLogLine {
-                        world_id: self.world_id,
-                        session_id: self.session_id,
-                        stream: LogStream::Stderr,
-                        line: "unexpected final stderr".into(),
-                        truncated: false,
-                    }),
-                ]
-            } else {
-                vec![ServerEvent::Raw(RawLogLine {
-                    world_id: self.world_id,
-                    session_id: self.session_id,
-                    stream: LogStream::Stdout,
-                    line: "server stopped cleanly".into(),
-                    truncated: false,
-                })]
-            }
+        fn drain_events(&self, max_raw: usize) -> Vec<ServerEvent> {
+            let mut pending = self.pending_events.borrow_mut();
+            let count = max_raw.min(pending.len());
+            pending.drain(..count).collect()
         }
     }
 
@@ -1131,10 +1131,47 @@ mod tests {
         type Process = FinalEventProcess;
 
         fn spawn(&mut self, spec: &LaunchSpec, session_id: SessionId) -> Result<Self::Process> {
+            let pending_events = if self.unexpected_exit {
+                let mut events = (0..70)
+                    .map(|index| {
+                        ServerEvent::Raw(RawLogLine {
+                            world_id: spec.world_id,
+                            session_id,
+                            stream: LogStream::Stdout,
+                            line: format!("unexpected log {index}"),
+                            truncated: false,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                events.push(ServerEvent::Raw(RawLogLine {
+                    world_id: spec.world_id,
+                    session_id,
+                    stream: LogStream::Stdout,
+                    line: "unexpected final stdout".into(),
+                    truncated: false,
+                }));
+                events.push(ServerEvent::Raw(RawLogLine {
+                    world_id: spec.world_id,
+                    session_id,
+                    stream: LogStream::Stderr,
+                    line: "unexpected final stderr".into(),
+                    truncated: false,
+                }));
+                events
+            } else {
+                vec![ServerEvent::Raw(RawLogLine {
+                    world_id: spec.world_id,
+                    session_id,
+                    stream: LogStream::Stdout,
+                    line: "server stopped cleanly".into(),
+                    truncated: false,
+                })]
+            };
             Ok(FinalEventProcess {
                 world_id: spec.world_id,
                 session_id,
                 unexpected_exit: self.unexpected_exit,
+                pending_events: RefCell::new(pending_events),
             })
         }
     }
@@ -1246,6 +1283,7 @@ mod tests {
             .poll_exit_with_events(world_id, 64)
             .expect("poll with events");
         assert!(matches!(exit, Some(ProcessExit { success: false, .. })));
+        assert!(events.len() > 64);
         assert!(events.iter().any(|event| matches!(
             event,
             ServerEvent::Raw(RawLogLine { line, .. }) if line == "unexpected final stdout"
