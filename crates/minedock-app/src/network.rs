@@ -128,14 +128,13 @@ unsafe fn parse_adapter_list(
 ) -> Vec<LanIpv4Candidate> {
     use std::mem::size_of;
 
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        IF_OPER_STATUS_OPERATIONAL, IP_ADAPTER_UNICAST_ADDRESS_LH,
-    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_UNICAST_ADDRESS_LH;
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 
     let mut candidates = Vec::new();
     while !adapter.is_null() {
         let adapter_ref = unsafe { &*adapter };
-        if adapter_ref.OperStatus == IF_OPER_STATUS_OPERATIONAL {
+        if adapter_ref.OperStatus == IfOperStatusUp {
             let interface_name = unsafe { windows_wide_string(adapter_ref.FriendlyName) };
             let mut unicast = adapter_ref.FirstUnicastAddress;
             while !unicast.is_null() {
