@@ -161,7 +161,7 @@ pub fn sanitize_log_text(value: &str, truncated: bool) -> Result<String> {
         redact_key_value(&mut text, key);
     }
     if text.len() > MAX_PERSISTED_LOG_TEXT_BYTES {
-        text.truncate(MAX_PERSISTED_LOG_TEXT_BYTES);
+        truncate_at_char_boundary(&mut text, MAX_PERSISTED_LOG_TEXT_BYTES);
         if !truncated {
             return Err(MineDockError::Persistence(
                 "raw log text exceeded its declared bound".into(),
@@ -174,6 +174,17 @@ pub fn sanitize_log_text(value: &str, truncated: bool) -> Result<String> {
         ));
     }
     Ok(text)
+}
+
+fn truncate_at_char_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
 }
 
 fn redact_key_value(text: &mut String, key: &str) {
@@ -219,5 +230,14 @@ mod tests {
         let record = RawLogRecord::from_event(Utc::now(), &raw).expect("record");
         assert!(record.text.contains("access_token=[REDACTED]"));
         assert!(!record.text.contains("secret"));
+    }
+
+    #[test]
+    fn raw_log_truncation_never_splits_a_multibyte_character() {
+        let raw = format!("{}é", "a".repeat(MAX_PERSISTED_LOG_TEXT_BYTES - 1));
+        let truncated = sanitize_log_text(&raw, true).expect("safe UTF-8 truncation");
+        assert_eq!(truncated.len(), MAX_PERSISTED_LOG_TEXT_BYTES - 1);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(sanitize_log_text(&raw, false).is_err());
     }
 }

@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 const BACKUPS_DIR: &str = "backups";
 const INDEX_FILE: &str = "index.json";
 const MANIFEST_FILE: &str = "manifest.json";
+const RECOVERY_FILE: &str = "recovery.json";
 const TEMP_SUFFIX: &str = ".part";
+const RECOVERY_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone)]
 pub struct SafeBackupEngine {
@@ -33,6 +35,13 @@ pub struct SafeBackupEngine {
 struct BackupIndex {
     schema_version: u16,
     records: Vec<BackupRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupRecoveryMarker {
+    schema_version: u16,
+    world_id: minedock_core::WorldId,
 }
 
 impl SafeBackupEngine {
@@ -80,6 +89,7 @@ impl SafeBackupEngine {
     }
 
     pub fn list(&self, world_id: minedock_core::WorldId) -> Result<Vec<BackupRecord>> {
+        self.reconcile_index(world_id)?;
         let index_path = self.index_path(world_id);
         if !index_path.exists() {
             return Ok(Vec::new());
@@ -130,9 +140,56 @@ impl SafeBackupEngine {
             }
             if metadata.is_dir() {
                 removed += cleanup_owned_partials(&path)?;
+                if let Some(world_name) = path.file_name().and_then(|value| value.to_str()) {
+                    if let Ok(world_id) = minedock_core::WorldId::parse(world_name) {
+                        self.reconcile_index(world_id)?;
+                    }
+                }
             }
         }
         Ok(removed)
+    }
+
+    pub fn mark_recovery_required(&self, world_id: minedock_core::WorldId) -> Result<()> {
+        let path = self.recovery_path(world_id);
+        let parent = path
+            .parent()
+            .ok_or_else(|| MineDockError::Backup("backup recovery path has no parent".into()))?;
+        prepare_directory(&self.root, parent)?;
+        write_json_atomic(
+            &path,
+            &BackupRecoveryMarker {
+                schema_version: RECOVERY_SCHEMA_VERSION,
+                world_id,
+            },
+        )
+    }
+
+    pub fn clear_recovery_required(&self, world_id: minedock_core::WorldId) -> Result<()> {
+        let path = self.recovery_path(world_id);
+        validate_owned_path(&self.root, &path)?;
+        if !path.exists() {
+            return Ok(());
+        }
+        remove_owned_path(&path)
+    }
+
+    pub fn recovery_required(&self, world_id: minedock_core::WorldId) -> Result<bool> {
+        let path = self.recovery_path(world_id);
+        validate_owned_path(&self.root, &path)?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        let bytes = fs::read(&path).map_err(io_backup)?;
+        let marker: BackupRecoveryMarker = serde_json::from_slice(&bytes).map_err(|error| {
+            MineDockError::Backup(format!("backup recovery marker is corrupt: {error}"))
+        })?;
+        if marker.schema_version != RECOVERY_SCHEMA_VERSION || marker.world_id != world_id {
+            return Err(MineDockError::Backup(
+                "backup recovery marker identity or schema is invalid".into(),
+            ));
+        }
+        Ok(true)
     }
 
     pub fn retain(
@@ -248,7 +305,12 @@ impl SafeBackupEngine {
         };
         record.validate()?;
         let mut records = self.list(world.id)?;
-        records.push(record.clone());
+        if !records
+            .iter()
+            .any(|existing| existing.backup_id == record.backup_id)
+        {
+            records.push(record.clone());
+        }
         records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         self.write_index(world.id, &records)?;
         Ok(record)
@@ -265,6 +327,105 @@ impl SafeBackupEngine {
         PathBuf::from(BACKUPS_DIR)
             .join(world_id.to_string())
             .join(backup_id.to_string())
+    }
+
+    fn recovery_path(&self, world_id: minedock_core::WorldId) -> PathBuf {
+        self.root
+            .join(BACKUPS_DIR)
+            .join(world_id.to_string())
+            .join(RECOVERY_FILE)
+    }
+
+    /// Rebuild the index from the published artifacts. This is deliberately
+    /// idempotent: a crash after artifact publication but before index commit
+    /// recovers the artifact, while a crash after retention deletion removes
+    /// stale index entries on the next read/startup.
+    fn reconcile_index(&self, world_id: minedock_core::WorldId) -> Result<()> {
+        let backup_root = self.root.join(BACKUPS_DIR).join(world_id.to_string());
+        if !backup_root.exists() {
+            return Ok(());
+        }
+        validate_owned_path(&self.root, &backup_root)?;
+        let records = self.scan_published_artifacts(world_id, &backup_root)?;
+        let index_path = self.index_path(world_id);
+        let current = if index_path.exists() {
+            validate_owned_path(&self.root, &index_path)?;
+            match fs::read(&index_path) {
+                Ok(bytes) => serde_json::from_slice::<BackupIndex>(&bytes)
+                    .ok()
+                    .and_then(|index| {
+                        (index.schema_version == minedock_core::BACKUP_SCHEMA_VERSION
+                            && index.records.iter().all(|record| {
+                                record.validate().is_ok()
+                                    && record.world_id == world_id
+                                    && record.artifact_path
+                                        == self.artifact_relative(world_id, record.backup_id)
+                            }))
+                        .then_some(index.records)
+                    }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(io_backup(error)),
+            }
+        } else {
+            None
+        };
+        if current.as_ref() != Some(&records) {
+            self.write_index(world_id, &records)?;
+        }
+        Ok(())
+    }
+
+    fn scan_published_artifacts(
+        &self,
+        world_id: minedock_core::WorldId,
+        backup_root: &Path,
+    ) -> Result<Vec<BackupRecord>> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(backup_root).map_err(io_backup)? {
+            let entry = entry.map_err(io_backup)?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == INDEX_FILE || name == RECOVERY_FILE || name.ends_with(TEMP_SUFFIX) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(io_backup)?;
+            if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                return Err(MineDockError::Backup(
+                    "backup catalog contains a symlink or reparse point".into(),
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(MineDockError::Backup(
+                    "backup catalog contains an unsupported entry".into(),
+                ));
+            }
+            let manifest_path = path.join(MANIFEST_FILE);
+            validate_owned_path(&self.root, &manifest_path)?;
+            let bytes = fs::read(&manifest_path).map_err(io_backup)?;
+            let manifest: BackupManifest = serde_json::from_slice(&bytes).map_err(|error| {
+                MineDockError::Backup(format!("backup manifest is corrupt: {error}"))
+            })?;
+            manifest.validate()?;
+            if manifest.world_id != world_id || name != manifest.backup_id.to_string() {
+                return Err(MineDockError::Backup(
+                    "backup artifact identity does not match its directory".into(),
+                ));
+            }
+            verify_artifact(&path, &manifest)?;
+            let record = BackupRecord {
+                schema_version: minedock_core::BACKUP_SCHEMA_VERSION,
+                backup_id: manifest.backup_id,
+                world_id,
+                created_at: manifest.created_at,
+                reason: manifest.reason,
+                artifact_path: self.artifact_relative(world_id, manifest.backup_id),
+                manifest,
+            };
+            record.validate()?;
+            records.push(record);
+        }
+        records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(records)
     }
 
     fn write_index(
@@ -374,6 +535,21 @@ fn hash_file(path: &Path) -> Result<(u64, String)> {
         size = size.saturating_add(count as u64);
     }
     Ok((size, format_digest(digest.finalize().as_slice())))
+}
+
+fn verify_artifact(artifact: &Path, manifest: &BackupManifest) -> Result<()> {
+    for entry in &manifest.files {
+        let path = artifact.join(&entry.path);
+        validate_owned_path(artifact, &path)?;
+        require_regular_file(&path)?;
+        let (size, sha256) = hash_file(&path)?;
+        if size != entry.size || sha256 != entry.sha256 {
+            return Err(MineDockError::Backup(
+                "backup artifact does not match its manifest".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn format_digest(bytes: &[u8]) -> String {
@@ -590,5 +766,44 @@ mod tests {
         fs::write(source.join("level.dat"), b"save").expect("save");
         let _ = engine.create(&value, BackupReason::Manual).expect("backup");
         assert!(!backup_dir.join("owned.part").exists());
+    }
+
+    #[test]
+    fn backup_index_reconciles_published_and_deleted_artifacts() {
+        let root = TempDir::new().expect("root");
+        let mut value = world();
+        value.status = WorldStatus::Stopped;
+        let source = root.path().join(&value.data_path).join("world");
+        fs::create_dir_all(&source).expect("world");
+        fs::write(source.join("level.dat"), b"save").expect("save");
+
+        let engine = SafeBackupEngine::new(root.path());
+        let record = engine.create(&value, BackupReason::Manual).expect("backup");
+        let index = root
+            .path()
+            .join(&record.artifact_path)
+            .with_file_name(INDEX_FILE);
+        fs::write(&index, b"not-json").expect("corrupt index");
+
+        // A published artifact is authoritative enough to rebuild an index
+        // after a crash between artifact rename and index commit.
+        assert_eq!(
+            engine.latest(value.id).expect("reconcile").as_ref(),
+            Some(&record)
+        );
+
+        let artifact = root.path().join(&record.artifact_path);
+        fs::remove_dir_all(&artifact).expect("remove artifact");
+        // A retention/index crash can leave a record pointing at a deleted
+        // artifact; the next read removes the stale reference.
+        assert!(
+            engine
+                .latest(value.id)
+                .expect("repair missing artifact")
+                .is_none()
+        );
+        let repaired: BackupIndex =
+            serde_json::from_slice(&fs::read(&index).expect("repaired index")).expect("index");
+        assert!(repaired.records.is_empty());
     }
 }

@@ -4,6 +4,13 @@ This checklist is the manual evidence record for Issue #13. It must be run on
 a clean Windows 11 machine with a compatible Java runtime and a second device
 on the same LAN. The repository's unit tests do not replace this native run.
 
+Release scope: `.github/workflows/windows-release.yml` currently builds the
+portable ZIP and uploads it as a GitHub Actions artifact. It does not create a
+GitHub Release. The ZIP plus SHA-256 sidecar is the current package contract;
+an installer and code signing are separate post-MVP work and are not implied
+by the Actions artifact. Issue #19 remains open until this checklist is
+completed and its evidence is recorded.
+
 1. Verify the ZIP SHA-256 sidecar and extract it to a new directory.
 2. Launch MineDock.exe.
 3. Confirm the app reports Java readiness or gives the Java settings path.

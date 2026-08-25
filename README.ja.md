@@ -39,10 +39,11 @@ MVPの実装として、ワールドライブラリ、ライフサイクル、�
 - 停止済みワールドだけを対象に、マニフェスト・ダイジェスト・アトミック公開・保持数制御を備えたローカルバックアップ
 - 正常なgraceful Stop後の自動バックアップ、診断情報、所有済み一時ダウンロードの復旧
 - [packaging/package-windows.ps1](packaging/package-windows.ps1)による、SHA-256 sidecar付きのロックされたWindows ZIPパッケージ
+- Windows向けworkflowはこのZIPをGitHub Actions artifactとしてアップロードするが、GitHub Releaseは作成しない。installerとコード署名はportable packageとは別のpost-MVP範囲
 
 Worldカードでは、停止中かつ予約されていないワールドだけStartを有効化し、Running中のワールドではgracefulな**Stop**を操作できる。詳細画面は再起動後も最新セッションログ、プレイヤー活動、バックアップ情報を読み戻す。バックアップポリシーが有効な場合、正常なgraceful Stop後だけ**Backing Up**へ進み、タイムアウト・強制停止・予期しない終了では安全なバックアップを主張しない。アプリを開いたりワールドを作成したりするだけでは、JARのダウンロードやサーバー起動は行わない。
 
-MVPの最終目標は[docs/MVP.md](docs/MVP.md)に記載しており、チェックリストの進捗は[PLAN.md](PLAN.md)で管理している。
+MVPの最終目標は[docs/MVP.md](docs/MVP.md)に記載しており、チェックリストの進捗は[PLAN.md](PLAN.md)で管理している。Issue #19はクリーンなWindows 11実機受入の証跡を記録するまで未完了とする。
 
 ## ソースから実行
 

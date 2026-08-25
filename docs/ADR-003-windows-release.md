@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted for the MVP portable package. A signed installer and an update
-service remain post-MVP release work.
+Accepted for the MVP portable package. Issue #19's clean-machine acceptance
+is still pending. A GitHub Release, signed installer, and update service are
+separate post-MVP release work.
 
 ## Decision
 
@@ -23,6 +24,9 @@ Java recovery screen is intentionally retained.
 - A clean-machine acceptance run must install/extract the ZIP, launch the
   executable, create a world, complete the EULA step, start, join over LAN,
   stop, verify the backup, relaunch, and confirm the saved world remains.
-- Release automation must publish the ZIP and its SHA-256 sidecar together.
+- The current workflow publishes the ZIP and its SHA-256 sidecar as a GitHub
+  Actions artifact; it does not publish a GitHub Release.
+- A GitHub Actions artifact, the portable ZIP, and a future installer/signing
+  pipeline are separate deliverables and must not be treated as equivalent.
 - The ZIP is not a security boundary or an installer; Windows SmartScreen and
   code signing policy must be handled before a public distribution.

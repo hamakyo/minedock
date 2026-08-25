@@ -4,7 +4,7 @@ Checklist status reflects code and tests in the repository, not the final MVP
 acceptance scenario. The implementation now includes persisted session logs,
 best-effort player activity, safe backups, telemetry-free diagnostics, and a
 portable Windows package workflow. The native Windows acceptance scenario is
-still a manual release gate.
+still a manual release gate (Issue #19 remains open).
 
 ## Phase 0 — Stabilize scaffold
 
@@ -145,6 +145,12 @@ Exit:
 - [x] Windows packaging.
 - [x] Basic telemetry-free diagnostics bundle.
 - [x] README user setup.
+- [ ] Issue #19 clean Windows 11 acceptance evidence.
+
+The release workflow currently uploads a portable ZIP and SHA-256 sidecar as
+a GitHub Actions artifact. It does not create a GitHub Release. Installer and
+code-signing deliverables remain post-MVP and are tracked separately from the
+portable package.
 
 ## Post-MVP backlog
 

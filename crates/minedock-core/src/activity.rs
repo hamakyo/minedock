@@ -4,7 +4,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PLAYER_ACTIVITY_SCHEMA_VERSION: u16 = 1;
+pub const PLAYER_ACTIVITY_SCHEMA_VERSION: u16 = 2;
+const LEGACY_PLAYER_ACTIVITY_SCHEMA_VERSION: u16 = 1;
 pub const MAX_PLAYER_NAME_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,10 +36,21 @@ pub struct PlayerActivity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ActivePlayerJoin {
+    pub name: String,
+    pub joined_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlayerActivitySnapshot {
     pub schema_version: u16,
     pub baseline: PresenceBaseline,
     pub current_players: Vec<String>,
+    /// The start of each currently open play interval. This is persisted so
+    /// a join in one output poll can be paired with a leave in a later poll.
+    #[serde(default)]
+    pub current_player_joined_at: Vec<ActivePlayerJoin>,
     pub players: Vec<PlayerActivity>,
     pub last_event_at: Option<DateTime<Utc>>,
 }
@@ -49,6 +61,7 @@ impl Default for PlayerActivitySnapshot {
             schema_version: PLAYER_ACTIVITY_SCHEMA_VERSION,
             baseline: PresenceBaseline::Unknown,
             current_players: Vec::new(),
+            current_player_joined_at: Vec::new(),
             players: Vec::new(),
             last_event_at: None,
         }
@@ -78,29 +91,48 @@ impl PlayerActivityTracker {
     }
 
     pub fn from_snapshot(snapshot: PlayerActivitySnapshot) -> Option<Self> {
-        if snapshot.schema_version != PLAYER_ACTIVITY_SCHEMA_VERSION
-            || snapshot
-                .current_players
-                .iter()
-                .any(|name| !valid_name(name))
-            || snapshot
-                .players
-                .iter()
-                .any(|player| !valid_name(&player.name))
+        if !matches!(
+            snapshot.schema_version,
+            LEGACY_PLAYER_ACTIVITY_SCHEMA_VERSION | PLAYER_ACTIVITY_SCHEMA_VERSION
+        ) {
+            return None;
+        }
+        let PlayerActivitySnapshot {
+            current_players,
+            current_player_joined_at,
+            players,
+            baseline,
+            last_event_at,
+            ..
+        } = snapshot;
+        if current_players.len() != current_players.iter().collect::<BTreeSet<_>>().len()
+            || current_players.iter().any(|name| !valid_name(name))
+            || players.iter().any(|player| !valid_name(&player.name))
         {
             return None;
         }
-        let players = snapshot
-            .players
-            .into_iter()
-            .map(|player| (player.name.clone(), player))
-            .collect();
+        let current: BTreeSet<_> = current_players.into_iter().collect();
+        let mut joined_at = BTreeMap::new();
+        for active in current_player_joined_at {
+            if !valid_name(&active.name)
+                || !current.contains(&active.name)
+                || joined_at.insert(active.name, active.joined_at).is_some()
+            {
+                return None;
+            }
+        }
+        let mut player_map = BTreeMap::new();
+        for player in players {
+            if player_map.insert(player.name.clone(), player).is_some() {
+                return None;
+            }
+        }
         Some(Self {
-            baseline: snapshot.baseline,
-            current: snapshot.current_players.into_iter().collect(),
-            players,
-            joined_at: BTreeMap::new(),
-            last_event_at: snapshot.last_event_at,
+            baseline,
+            current,
+            players: player_map,
+            joined_at,
+            last_event_at,
         })
     }
 
@@ -141,8 +173,25 @@ impl PlayerActivityTracker {
             schema_version: PLAYER_ACTIVITY_SCHEMA_VERSION,
             baseline: self.baseline,
             current_players: self.current.iter().cloned().collect(),
+            current_player_joined_at: self
+                .joined_at
+                .iter()
+                .map(|(name, joined_at)| ActivePlayerJoin {
+                    name: name.clone(),
+                    joined_at: *joined_at,
+                })
+                .collect(),
             players: self.players.values().cloned().collect(),
             last_event_at: self.last_event_at,
+        }
+    }
+
+    /// Close every open interval exactly once, for example when a session is
+    /// finalized after the process has stopped without emitting leave lines.
+    pub fn finalize(&mut self, timestamp: DateTime<Utc>) {
+        let current_players: Vec<_> = self.current.iter().cloned().collect();
+        for name in current_players {
+            let _ = self.leave(&name, timestamp);
         }
     }
 
@@ -353,5 +402,46 @@ mod tests {
             }
         ));
         assert!(tracker.snapshot().current_players.is_empty());
+    }
+
+    #[test]
+    fn active_join_timestamps_survive_snapshot_restore() {
+        let mut tracker = PlayerActivityTracker::new();
+        assert!(tracker.apply(time(1), VanillaLogEvent::ServerReady));
+        assert!(tracker.apply(
+            time(2),
+            VanillaLogEvent::PlayerJoined {
+                name: "Alex".into()
+            }
+        ));
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.current_player_joined_at[0].joined_at, time(2));
+        let mut restored = PlayerActivityTracker::from_snapshot(snapshot).expect("restore");
+        assert_eq!(restored.summary_at(time(5)).total_playtime_seconds, 3);
+        assert!(restored.apply(
+            time(7),
+            VanillaLogEvent::PlayerLeft {
+                name: "Alex".into()
+            }
+        ));
+        assert_eq!(restored.summary_at(time(8)).total_playtime_seconds, 5);
+    }
+
+    #[test]
+    fn finalize_closes_open_intervals_only_once() {
+        let mut tracker = PlayerActivityTracker::new();
+        assert!(tracker.apply(time(1), VanillaLogEvent::ServerReady));
+        assert!(tracker.apply(
+            time(2),
+            VanillaLogEvent::PlayerJoined {
+                name: "Alex".into()
+            }
+        ));
+        tracker.finalize(time(5));
+        assert!(tracker.snapshot().current_players.is_empty());
+        assert_eq!(tracker.summary_at(time(10)).total_playtime_seconds, 3);
+        tracker.finalize(time(20));
+        assert_eq!(tracker.summary_at(time(20)).total_playtime_seconds, 3);
     }
 }

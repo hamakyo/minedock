@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -25,7 +25,7 @@ use minedock_core::{
     LifecyclePersistence, LifecycleSupervisor, LogStream, MineDockError, OFFICIAL_EULA_URL,
     PlayerActivityTracker, PresenceBaseline, ProcessExit, ServerEvent, SessionExitReason,
     SessionId, StopEscalationToken, StopOutcome, TemplateCatalog, TemplateId, World, WorldId,
-    WorldLibrary, WorldStatus, normalize_world_name,
+    WorldLibrary, WorldRepository, WorldStatus, normalize_world_name,
 };
 
 mod backup;
@@ -52,7 +52,11 @@ type LifecyclePollResult = (WorldId, minedock_core::Result<Option<ProcessExit>>)
 type LifecyclePollResults = Vec<LifecyclePollResult>;
 type LifecyclePollEventResult = (
     WorldId,
-    minedock_core::Result<(Option<ProcessExit>, Vec<ServerEvent>)>,
+    minedock_core::Result<(
+        Option<ProcessExit>,
+        Vec<ServerEvent>,
+        Option<session_store::SessionSnapshot>,
+    )>,
 );
 type LifecyclePollEventResults = Vec<LifecyclePollEventResult>;
 type LifecycleStopEventResult = minedock_core::Result<(Option<StopOutcome>, Vec<ServerEvent>)>;
@@ -306,6 +310,7 @@ where
 fn execute_lifecycle_stop_with_events<P, F, L>(
     mut lifecycle: LifecycleSupervisor<P, F, L>,
     world_id: WorldId,
+    backup_after_stop: bool,
     session_store: Option<session_store::SessionLogStore>,
 ) -> LifecycleStopEventBatch<P, F, L>
 where
@@ -314,7 +319,11 @@ where
     L: minedock_core::LifecycleLeaseProvider,
 {
     let session_id = lifecycle.session_id(world_id);
-    let mut result = lifecycle.stop_with_events(world_id, STOP_TIMEOUT, 64);
+    let mut result = if backup_after_stop {
+        lifecycle.stop_with_events_for_backup(world_id, STOP_TIMEOUT, 64)
+    } else {
+        lifecycle.stop_with_events(world_id, STOP_TIMEOUT, 64)
+    };
     if let (Some(store), Some(session_id)) = (session_store, session_id) {
         if let Ok((outcome, events)) = &result {
             if let Err(error) = store.append_events(world_id, session_id, events) {
@@ -389,34 +398,95 @@ where
 }
 
 fn execute_automatic_backup(
-    mut lifecycle: AppLifecycle,
+    lifecycle: AppLifecycle,
     engine: backup::SafeBackupEngine,
     world: World,
 ) -> (AppLifecycle, minedock_core::Result<BackupRecord>) {
-    let result = (|| {
-        lifecycle
-            .persistence_mut()
-            .persist_status(world.id, WorldStatus::BackingUp)?;
-        let record = match engine.create(&world, BackupReason::Shutdown) {
-            Ok(record) => record,
-            Err(error) => {
-                let _ = lifecycle
-                    .persistence_mut()
-                    .persist_status(world.id, WorldStatus::Stopped);
-                return Err(error);
-            }
-        };
-        if let Err(error) = engine.retain(world.id, world.backup.retain) {
-            let _ = lifecycle
+    execute_backup_with_recovery(lifecycle, engine, world, BackupReason::Shutdown, true)
+}
+
+fn execute_recovery_backup(
+    lifecycle: AppLifecycle,
+    engine: backup::SafeBackupEngine,
+    world: World,
+) -> (AppLifecycle, minedock_core::Result<BackupRecord>) {
+    execute_backup_with_recovery(lifecycle, engine, world, BackupReason::Manual, false)
+}
+
+fn execute_backup_with_recovery(
+    mut lifecycle: AppLifecycle,
+    engine: backup::SafeBackupEngine,
+    world: World,
+    reason: BackupReason,
+    core_backup_pending: bool,
+) -> (AppLifecycle, minedock_core::Result<BackupRecord>) {
+    // Automatic shutdown enters this worker from core's persisted BackingUp
+    // boundary. Recovery retries use the same durable failure contract. Never
+    // fall back to Stopped on an error: the recovery marker and Failed state
+    // keep Start disabled until the user explicitly resolves the failure.
+    let result: minedock_core::Result<BackupRecord> = (|| {
+        let record = engine.create(&world, reason)?;
+        engine.retain(world.id, world.backup.retain)?;
+        engine.clear_recovery_required(world.id)?;
+        if core_backup_pending {
+            lifecycle.complete_backup(world.id)?;
+        } else {
+            lifecycle
                 .persistence_mut()
-                .persist_status(world.id, WorldStatus::Stopped);
-            return Err(error);
+                .persist_status(world.id, WorldStatus::Stopped)?;
         }
-        lifecycle
-            .persistence_mut()
-            .persist_status(world.id, WorldStatus::Stopped)?;
         Ok(record)
     })();
+    let result = match result {
+        Ok(record) => Ok(record),
+        Err(error) => {
+            let mut recovery_errors = vec![error.to_string()];
+            if let Err(recovery_error) = engine.mark_recovery_required(world.id) {
+                recovery_errors.push(format!(
+                    "could not persist backup recovery marker: {recovery_error}"
+                ));
+            }
+            let status_result = if core_backup_pending {
+                lifecycle.fail_backup(world.id)
+            } else {
+                lifecycle
+                    .persistence_mut()
+                    .persist_status(world.id, WorldStatus::Failed)
+            };
+            if let Err(status_error) = status_result {
+                recovery_errors.push(format!(
+                    "could not persist Failed backup state: {status_error}"
+                ));
+            }
+            Err(MineDockError::Backup(recovery_errors.join("; ")))
+        }
+    };
+    (lifecycle, result)
+}
+
+fn execute_continue_without_backup(
+    mut lifecycle: AppLifecycle,
+    engine: backup::SafeBackupEngine,
+    world_id: WorldId,
+) -> (AppLifecycle, minedock_core::Result<()>) {
+    let result = (|| {
+        // Persist Stopped before removing the recovery marker. If the app
+        // stops between these writes, the marker still keeps Start disabled.
+        lifecycle
+            .persistence_mut()
+            .persist_status(world_id, WorldStatus::Stopped)?;
+        engine.clear_recovery_required(world_id)
+    })();
+    let result = match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = engine.mark_recovery_required(world_id);
+            let _ = lifecycle
+                .persistence_mut()
+                .persist_status(world_id, WorldStatus::Failed);
+            Err(error)
+        }
+    };
     (lifecycle, result)
 }
 
@@ -484,10 +554,13 @@ where
                                 return (world_id, Err(error));
                             }
                         }
-                        Ok((exit, events))
+                        store
+                            .latest_snapshot(world_id)
+                            .map(|snapshot| (exit, events, snapshot))
                     }
                 }
-                (_, _, result) => result,
+                (_, _, Ok((exit, events))) => Ok((exit, events, None)),
+                (_, _, Err(error)) => Err(error),
             };
             (world_id, result)
         })
@@ -1170,6 +1243,7 @@ struct MineDockView {
     persisted_sessions: HashMap<WorldId, session_store::SessionSnapshot>,
     backup_engine: Option<backup::SafeBackupEngine>,
     latest_backups: HashMap<WorldId, BackupRecord>,
+    backup_recovery_required: HashSet<WorldId>,
     backup_error: Option<String>,
     diagnostics_notice: Option<String>,
 }
@@ -1220,6 +1294,7 @@ impl MineDockView {
                     persisted_sessions: HashMap::new(),
                     backup_engine: None,
                     latest_backups: HashMap::new(),
+                    backup_recovery_required: HashSet::new(),
                     backup_error: None,
                     diagnostics_notice: None,
                 };
@@ -1233,6 +1308,8 @@ impl MineDockView {
         let mut lifecycle = None;
         let mut session_store = None;
         let mut backup_engine = None;
+        let mut backup_recovery_required = HashSet::new();
+        let mut interrupted_backup_recovery = HashSet::new();
         let library = match resolve_app_data_root() {
             Ok(root) => {
                 let repository = JsonWorldRepository::new(root);
@@ -1252,6 +1329,22 @@ impl MineDockView {
                             }
                             Err(error) => settings_error = Some(error),
                         }
+                        match repository.load() {
+                            Ok(metadata) => {
+                                interrupted_backup_recovery.extend(
+                                    metadata
+                                        .worlds
+                                        .into_iter()
+                                        .filter(|world| world.status == WorldStatus::BackingUp)
+                                        .map(|world| world.id),
+                                );
+                            }
+                            Err(error) => {
+                                startup_error = Some(format!(
+                                    "MineDock metadata could not be inspected for backup recovery: {error}"
+                                ));
+                            }
+                        }
                         if let Err(error) =
                             lifecycle_adapter::JsonLifecyclePersistence::recover_startup(
                                 &repository,
@@ -1266,6 +1359,18 @@ impl MineDockView {
                                     startup_error = Some(format!(
                                         "MineDock session-log recovery failed: {error}"
                                     ));
+                                }
+                            }
+                        }
+                        if startup_error.is_none() {
+                            if let Some(engine) = &backup_engine {
+                                for world_id in &interrupted_backup_recovery {
+                                    if let Err(error) = engine.mark_recovery_required(*world_id) {
+                                        startup_error = Some(format!(
+                                            "MineDock could not preserve interrupted backup recovery: {error}"
+                                        ));
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1306,6 +1411,24 @@ impl MineDockView {
                 if startup_error.is_none() {
                     if let Err(error) = library.load() {
                         startup_error = Some(format!("MineDock metadata could not load: {error}"));
+                    }
+                }
+                if startup_error.is_none() {
+                    if let Some(engine) = &backup_engine {
+                        for world in library.list() {
+                            match engine.recovery_required(world.id) {
+                                Ok(true) => {
+                                    backup_recovery_required.insert(world.id);
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    startup_error = Some(format!(
+                                        "MineDock backup recovery state could not load: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 Some(library)
@@ -1410,6 +1533,7 @@ impl MineDockView {
             persisted_sessions: HashMap::new(),
             backup_engine,
             latest_backups: HashMap::new(),
+            backup_recovery_required,
             backup_error: None,
             diagnostics_notice: None,
         }
@@ -1612,6 +1736,9 @@ impl MineDockView {
     }
 
     fn can_start_world(&self, world_id: WorldId) -> bool {
+        if self.backup_recovery_required.contains(&world_id) {
+            return false;
+        }
         let Some(world) = self
             .library
             .as_ref()
@@ -1737,8 +1864,16 @@ impl MineDockView {
                     .map(|(world_id, _)| *world_id);
                 for (world_id, result) in results {
                     match result {
-                        Ok((exit, events)) => {
+                        Ok((exit, events, snapshot)) => {
                             view.record_server_events(world_id, events);
+                            if let Some(snapshot) = snapshot {
+                                // Keep the details projection live while the
+                                // server is running. The snapshot contains
+                                // persisted join timestamps, so the renderer
+                                // can recompute open-interval playtime on each
+                                // poll notification without reopening details.
+                                view.persisted_sessions.insert(world_id, snapshot);
+                            }
                             match exit {
                                 Some(exit) => {
                                     should_reload = true;
@@ -1987,6 +2122,13 @@ impl MineDockView {
             cx.notify();
             return;
         };
+        let backup_after_stop = self
+            .library
+            .as_ref()
+            .and_then(|library| library.get(world_id))
+            .is_some_and(|world| {
+                world.backup.enabled && world.backup.on_shutdown && self.backup_engine.is_some()
+            });
 
         self.active_operation = Some(LifecycleOperation::Stopping(world_id));
         self.pending_force_stop = None;
@@ -1997,7 +2139,12 @@ impl MineDockView {
 
         let session_store = self.session_store.clone();
         let worker = cx.background_executor().spawn(async move {
-            execute_lifecycle_stop_with_events(lifecycle, world_id, session_store)
+            execute_lifecycle_stop_with_events(
+                lifecycle,
+                world_id,
+                backup_after_stop,
+                session_store,
+            )
         });
         cx.spawn(async move |this, cx| {
             let (lifecycle, result) = worker.await;
@@ -2027,9 +2174,8 @@ impl MineDockView {
                                             .cloned()
                                             .map(|mut world| {
                                                 // The lifecycle supervisor has already
-                                                // authoritatively reached Stopped; the
-                                                // library projection is reloaded after the
-                                                // worker returns.
+                                                // authoritatively reached BackingUp; the
+                                                // backup source is a stopped world snapshot.
                                                 world.status = WorldStatus::Stopped;
                                                 world
                                             });
@@ -2132,11 +2278,148 @@ impl MineDockView {
                 match result {
                     Ok(record) => {
                         view.latest_backups.insert(world_id, record);
+                        view.backup_recovery_required.remove(&world_id);
                         view.backup_error = None;
                         view.lifecycle_error = None;
                     }
                     Err(error) => {
+                        view.backup_recovery_required.insert(world_id);
                         view.backup_error = Some(format!("Automatic backup failed: {error}"));
+                        view.lifecycle_error = view.backup_error.clone();
+                    }
+                }
+                if let Some(library) = view.library.as_mut() {
+                    if let Err(error) = library.reload() {
+                        view.lifecycle_error = Some(match view.lifecycle_error.take() {
+                            Some(existing) => {
+                                format!("{existing} Could not refresh world state: {error}")
+                            }
+                            None => format!("Could not refresh world state: {error}"),
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn retry_backup(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.backup_recovery_required.contains(&world_id) || self.active_operation.is_some() {
+            return;
+        }
+        let Some(mut world) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.get(world_id))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(engine) = self.backup_engine.clone() else {
+            self.backup_error = Some("The backup engine is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(lifecycle) = self._lifecycle.take() else {
+            self.backup_error = Some("The lifecycle runtime is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        // The process is already gone after an automatic backup failure. The
+        // backup engine receives a stopped source, while the persisted Failed
+        // state remains in force until the worker succeeds.
+        world.status = WorldStatus::Stopped;
+        self.active_operation = Some(LifecycleOperation::BackingUp(world_id));
+        self.status_overrides
+            .insert(world_id, WorldStatus::BackingUp);
+        self.backup_error = None;
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_recovery_backup(lifecycle, engine, world) });
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, result) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                view.active_operation = None;
+                view.status_overrides.remove(&world_id);
+                match result {
+                    Ok(record) => {
+                        view.latest_backups.insert(world_id, record);
+                        view.backup_recovery_required.remove(&world_id);
+                        view.backup_error = None;
+                        view.lifecycle_error = None;
+                    }
+                    Err(error) => {
+                        view.backup_recovery_required.insert(world_id);
+                        view.backup_error = Some(format!("Backup retry failed: {error}"));
+                        view.lifecycle_error = view.backup_error.clone();
+                    }
+                }
+                if let Some(library) = view.library.as_mut() {
+                    if let Err(error) = library.reload() {
+                        view.lifecycle_error = Some(match view.lifecycle_error.take() {
+                            Some(existing) => {
+                                format!("{existing} Could not refresh world state: {error}")
+                            }
+                            None => format!("Could not refresh world state: {error}"),
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn continue_without_backup(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.backup_recovery_required.contains(&world_id) || self.active_operation.is_some() {
+            return;
+        }
+        let Some(engine) = self.backup_engine.clone() else {
+            self.backup_error = Some("The backup engine is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(lifecycle) = self._lifecycle.take() else {
+            self.backup_error = Some("The lifecycle runtime is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        self.active_operation = Some(LifecycleOperation::BackingUp(world_id));
+        self.status_overrides
+            .insert(world_id, WorldStatus::BackingUp);
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_continue_without_backup(lifecycle, engine, world_id) });
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, result) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                view.active_operation = None;
+                view.status_overrides.remove(&world_id);
+                match result {
+                    Ok(()) => {
+                        view.backup_recovery_required.remove(&world_id);
+                        view.backup_error = None;
+                        view.lifecycle_error = None;
+                    }
+                    Err(error) => {
+                        view.backup_recovery_required.insert(world_id);
+                        view.backup_error =
+                            Some(format!("Could not continue without a backup: {error}"));
                         view.lifecycle_error = view.backup_error.clone();
                     }
                 }
@@ -2932,6 +3215,13 @@ impl MineDockView {
             && self.active_operation.is_none()
             && self.can_mutate()
             && self.backup_engine.is_some();
+        let backup_recovery_required = self.backup_recovery_required.contains(&world_id);
+        let backup_recovery_action_enabled = backup_recovery_required
+            && status == WorldStatus::Failed
+            && self.active_operation.is_none()
+            && self.can_mutate()
+            && self.backup_engine.is_some()
+            && self._lifecycle.is_some();
         div()
             .absolute()
             .inset_0()
@@ -3042,6 +3332,29 @@ impl MineDockView {
                     )
                     .when_some(self.backup_error.clone(), |element, error| {
                         element.child(div().text_color(rgb(0xFF9B9B)).child(error))
+                    })
+                    .when(backup_recovery_required, |element| {
+                        element.child(
+                            div()
+                                .flex()
+                                .gap(px(8.))
+                                .child(button(
+                                    language.text(UiText::RetryBackup),
+                                    rgb(0x3D5A88),
+                                    backup_recovery_action_enabled,
+                                    cx.listener(move |view, event, window, cx| {
+                                        view.retry_backup(world_id, event, window, cx)
+                                    }),
+                                ))
+                                .child(button(
+                                    language.text(UiText::ContinueWithoutBackup),
+                                    rgb(0x6D5B3B),
+                                    backup_recovery_action_enabled,
+                                    cx.listener(move |view, event, window, cx| {
+                                        view.continue_without_backup(world_id, event, window, cx)
+                                    }),
+                                )),
+                        )
                     })
                     .child(button(
                         language.text(UiText::BackupNow),
@@ -3637,17 +3950,19 @@ mod tests {
     use super::{
         EULA_ACCEPTANCE_FILE, JavaPathInputError, LifecycleOperation, RecentLogLine,
         clear_recent_logs_for_new_session, eula_acceptance_path, eula_requires_confirmation,
+        execute_backup_with_recovery, execute_continue_without_backup,
         execute_lifecycle_force_stop, execute_lifecycle_poll, execute_lifecycle_poll_and_drain,
         execute_lifecycle_start, execute_lifecycle_stop, format_playtime, parse_java_path_input,
         poll_exit_allowed, select_java_runtime, start_allowed, stop_allowed,
         utf16_range_to_byte_range,
     };
     use minedock_core::{
-        EulaAcceptanceRepository, FileEulaAcceptanceRepository, GracefulStopResult,
-        InMemoryLifecyclePersistence, JavaMajor, JavaReadiness, JavaRequirement,
-        JavaUnavailableReason, LaunchSpec, LifecycleLeaseProvider, ProcessExit, ProcessFactory,
-        ServerEvent, ServerProcess, SessionId, StopEscalationToken, ValidatedServerCommand,
-        WorldId, WorldStatus,
+        AppMetadata, CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository,
+        GracefulStopResult, InMemoryLifecyclePersistence, JavaMajor, JavaReadiness,
+        JavaRequirement, JavaUnavailableReason, JsonWorldRepository, LaunchSpec,
+        LifecycleLeaseProvider, ProcessExit, ProcessFactory, ServerEvent, ServerProcess, SessionId,
+        StopEscalationToken, TemplateCatalog, ValidatedServerCommand, WorldId, WorldRepository,
+        WorldStatus,
     };
     use std::cell::Cell;
     use std::collections::{HashMap, VecDeque};
@@ -3677,7 +3992,9 @@ mod tests {
         exits_on_poll: bool,
         poll_exit_success: bool,
         emit_final_events: bool,
+        emit_poll_events: bool,
         final_events_ready: Cell<bool>,
+        poll_events_emitted: Cell<bool>,
     }
 
     impl ServerProcess for TestProcess {
@@ -3748,7 +4065,15 @@ mod tests {
         }
 
         fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
-            if self.emit_final_events && self.final_events_ready.replace(false) {
+            if self.emit_poll_events && !self.poll_events_emitted.replace(true) {
+                vec![ServerEvent::Raw(minedock_core::RawLogLine {
+                    world_id: self.world_id,
+                    session_id: self.session_id,
+                    stream: minedock_core::LogStream::Stdout,
+                    line: "[Server thread/INFO]: Alex joined the game".into(),
+                    truncated: false,
+                })]
+            } else if self.emit_final_events && self.final_events_ready.replace(false) {
                 vec![
                     ServerEvent::Raw(minedock_core::RawLogLine {
                         world_id: self.world_id,
@@ -3777,6 +4102,7 @@ mod tests {
         exits_on_poll: bool,
         poll_exit_success: bool,
         emit_final_events: bool,
+        emit_poll_events: bool,
     }
 
     impl ProcessFactory for TestProcessFactory {
@@ -3794,7 +4120,9 @@ mod tests {
                 exits_on_poll: self.exits_on_poll,
                 poll_exit_success: self.poll_exit_success,
                 emit_final_events: self.emit_final_events,
+                emit_poll_events: self.emit_poll_events,
                 final_events_ready: Cell::new(false),
+                poll_events_emitted: Cell::new(false),
             })
         }
     }
@@ -3942,6 +4270,50 @@ mod tests {
     }
 
     #[test]
+    fn failed_automatic_backup_requires_an_explicit_recovery_choice() {
+        let root = TempDir::new().expect("temporary app data");
+        let repository = JsonWorldRepository::new(root.path());
+        let catalog = TemplateCatalog::built_in().expect("templates");
+        let world = CreateWorldRequest::new("Backup recovery", "creative")
+            .expect("request")
+            .build_world(&catalog)
+            .expect("world");
+        repository
+            .save(&AppMetadata::new(vec![world.clone()]))
+            .expect("metadata");
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            super::lifecycle_adapter::JsonLifecyclePersistence::new(repository.clone()),
+            super::native_process::NativeProcessFactory,
+            super::lifecycle_adapter::AppDataLeaseProvider::default(),
+        );
+        let engine = super::backup::SafeBackupEngine::new(root.path());
+
+        let (lifecycle, result) = execute_backup_with_recovery(
+            lifecycle,
+            engine.clone(),
+            world.clone(),
+            minedock_core::BackupReason::Shutdown,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(engine.recovery_required(world.id).expect("marker"));
+        assert_eq!(
+            repository.load().expect("failed metadata").worlds[0].status,
+            WorldStatus::Failed
+        );
+
+        let (lifecycle, continued) =
+            execute_continue_without_backup(lifecycle, engine.clone(), world.id);
+        assert!(continued.is_ok());
+        assert!(!engine.recovery_required(world.id).expect("cleared marker"));
+        assert_eq!(
+            repository.load().expect("continued metadata").worlds[0].status,
+            WorldStatus::Stopped
+        );
+        let _ = lifecycle;
+    }
+
+    #[test]
     fn stop_is_enabled_only_for_a_running_session_without_an_active_operation() {
         assert!(stop_allowed(WorldStatus::Running, true, false, true));
         for status in [
@@ -4066,6 +4438,7 @@ mod tests {
                 exits_on_poll: false,
                 poll_exit_success: false,
                 emit_final_events: false,
+                emit_poll_events: false,
             },
             TestLeaseProvider,
         );
@@ -4106,6 +4479,7 @@ mod tests {
                 exits_on_poll: true,
                 poll_exit_success: true,
                 emit_final_events: false,
+                emit_poll_events: false,
             },
             TestLeaseProvider,
         );
@@ -4149,6 +4523,7 @@ mod tests {
                 exits_on_poll: true,
                 poll_exit_success: false,
                 emit_final_events: false,
+                emit_poll_events: false,
             },
             TestLeaseProvider,
         );
@@ -4181,6 +4556,7 @@ mod tests {
                 exits_on_poll: true,
                 poll_exit_success: false,
                 emit_final_events: true,
+                emit_poll_events: false,
             },
             TestLeaseProvider,
         );
@@ -4193,8 +4569,9 @@ mod tests {
         let (lifecycle, results) =
             execute_lifecycle_poll_and_drain(lifecycle, [world_id], None, None);
         let (_, result) = results.into_iter().next().expect("poll result");
-        let (exit, events) = result.expect("poll with events");
+        let (exit, events, snapshot) = result.expect("poll with events");
         assert!(matches!(exit, Some(ProcessExit { success: false, .. })));
+        assert!(snapshot.is_none());
         assert!(events.iter().any(|event| matches!(
             event,
             ServerEvent::Raw(minedock_core::RawLogLine { line, .. })
@@ -4210,5 +4587,41 @@ mod tests {
             Some(WorldStatus::Failed)
         );
         assert!(lifecycle.session_id(world_id).is_none());
+    }
+
+    #[test]
+    fn running_poll_returns_the_updated_activity_projection() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory {
+                stop_times_out: false,
+                exits_on_poll: false,
+                poll_exit_success: false,
+                emit_final_events: false,
+                emit_poll_events: true,
+            },
+            TestLeaseProvider,
+        );
+        let (lifecycle, started) =
+            execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+                Ok(test_launch_spec(world_id))
+            });
+        let session_id = started.expect("start");
+        let store = super::session_store::SessionLogStore::new(root.path());
+        store
+            .begin_session(world_id, session_id, Some(42))
+            .expect("session record");
+
+        let (_, results) =
+            execute_lifecycle_poll_and_drain(lifecycle, [world_id], None, Some(store));
+        let (_, result) = results.into_iter().next().expect("poll result");
+        let (exit, events, snapshot) = result.expect("running poll");
+        assert!(exit.is_none());
+        assert!(!events.is_empty());
+        let snapshot = snapshot.expect("updated session projection");
+        assert_eq!(snapshot.activity.current_players, vec!["Alex"]);
+        assert_eq!(snapshot.activity.current_player_joined_at.len(), 1);
     }
 }

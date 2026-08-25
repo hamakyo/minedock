@@ -222,7 +222,32 @@ impl SessionLogStore {
                 "cannot finalize a session with mismatched identity".into(),
             ));
         }
-        record.finalize(Utc::now(), reason)?;
+        let ended_at = Utc::now();
+        let activity_path = path
+            .parent()
+            .ok_or_else(|| {
+                minedock_core::MineDockError::Persistence(
+                    "session record has no parent directory".into(),
+                )
+            })?
+            .join(ACTIVITY_FILE_NAME);
+        let activity = if activity_path.exists() {
+            read_json::<PlayerActivitySnapshot>(&activity_path)?
+        } else {
+            PlayerActivitySnapshot::default()
+        };
+        let mut tracker = PlayerActivityTracker::from_snapshot(activity).ok_or_else(|| {
+            minedock_core::MineDockError::Persistence(
+                "session activity snapshot is corrupt or unsupported".into(),
+            )
+        })?;
+        tracker.finalize(ended_at);
+        // Persist the closed activity projection before marking the session
+        // complete. If the process dies between these two atomic writes,
+        // startup reconciliation can safely finalize the already-closed
+        // projection again because there are no open intervals left.
+        write_json_atomic(&activity_path, &tracker.snapshot())?;
+        record.finalize(ended_at, reason)?;
         write_json_atomic(&path, &record)
     }
 
@@ -507,5 +532,42 @@ mod tests {
             .expect("snapshot")
             .expect("one");
         assert!(snapshot.record.ended_at.is_some());
+    }
+
+    #[test]
+    fn finalizing_a_session_closes_open_player_activity() {
+        let root = TempDir::new().expect("root");
+        let store = SessionLogStore::new(root.path());
+        let world_id = WorldId::new();
+        let session_id = SessionId::new();
+        store
+            .begin_session(world_id, session_id, Some(42))
+            .expect("begin");
+        store
+            .append_events(
+                world_id,
+                session_id,
+                &[ServerEvent::Raw(RawLogLine {
+                    world_id,
+                    session_id,
+                    stream: LogStream::Stdout,
+                    line: "[Server thread/INFO]: Alex joined the game".into(),
+                    truncated: false,
+                })],
+            )
+            .expect("join");
+        store
+            .finalize(
+                world_id,
+                session_id,
+                SessionExitReason::Graceful { code: Some(0) },
+            )
+            .expect("finalize");
+        let snapshot = store
+            .latest_snapshot(world_id)
+            .expect("snapshot")
+            .expect("one");
+        assert!(snapshot.activity.current_players.is_empty());
+        assert!(snapshot.activity.current_player_joined_at.is_empty());
     }
 }

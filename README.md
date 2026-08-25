@@ -44,6 +44,9 @@ Windows package. Native clean-machine acceptance remains a manual release gate:
 - a locked portable Windows ZIP workflow in
   [packaging/package-windows.ps1](packaging/package-windows.ps1), with a
   SHA-256 sidecar.
+- a Windows release workflow that uploads that ZIP as a GitHub Actions
+  artifact; it does not publish a GitHub Release. Installer and code-signing
+  work remain outside this portable-package scope.
 
 World cards enable **Start** only for stopped, unreserved worlds and expose
 graceful **Stop** controls for running worlds. The detail view reloads the
@@ -53,7 +56,9 @@ world's policy enables shutdown backups; timeout, force-stop, and unexpected
 exit paths never claim a safe backup. Opening the app or creating a world still
 does not download a JAR or launch a server.
 
-The target MVP remains the end-to-end scenario in [docs/MVP.md](docs/MVP.md); checklist status is tracked in [PLAN.md](PLAN.md).
+The target MVP remains the end-to-end scenario in [docs/MVP.md](docs/MVP.md);
+checklist status is tracked in [PLAN.md](PLAN.md). Issue #19 remains open
+until the clean Windows 11 acceptance evidence is recorded.
 
 ## Run from source
 
