@@ -13,6 +13,7 @@ use minedock_core::{
 use std::fs;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -40,6 +41,7 @@ pub struct NativeServerProcess {
     reliable_rx: Receiver<ReliableLifecycleEvent>,
     reliable_tx: Sender<ReliableLifecycleEvent>,
     raw_drop_count: Arc<Mutex<u64>>,
+    reader_remaining: Arc<AtomicUsize>,
     finished: bool,
 }
 
@@ -109,6 +111,7 @@ impl NativeServerProcess {
         let (raw_tx, raw_rx) = mpsc::sync_channel(RAW_EVENT_CHANNEL_CAPACITY);
         let (reliable_tx, reliable_rx) = mpsc::channel();
         let drop_count = Arc::new(Mutex::new(0_u64));
+        let reader_remaining = Arc::new(AtomicUsize::new(2));
         spawn_reader(
             stdout,
             LogStream::Stdout,
@@ -116,6 +119,7 @@ impl NativeServerProcess {
             session_id,
             raw_tx.clone(),
             drop_count.clone(),
+            reader_remaining.clone(),
         );
         spawn_reader(
             stderr,
@@ -124,6 +128,7 @@ impl NativeServerProcess {
             session_id,
             raw_tx,
             drop_count.clone(),
+            reader_remaining.clone(),
         );
         reliable_tx
             .send(ReliableLifecycleEvent::Spawned { pid: child.id() })
@@ -138,6 +143,7 @@ impl NativeServerProcess {
             reliable_rx,
             reliable_tx,
             raw_drop_count: drop_count,
+            reader_remaining,
             finished: false,
         })
     }
@@ -161,6 +167,7 @@ impl NativeServerProcess {
         let status = self.child.wait().map_err(|error| {
             MineDockError::Process(format!("could not wait for server process: {error}"))
         })?;
+        self.wait_for_readers_bounded();
         Ok(self.record_exit(status))
     }
 
@@ -168,7 +175,10 @@ impl NativeServerProcess {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(self.record_exit(status)),
+                Ok(Some(status)) => {
+                    self.wait_for_readers_bounded();
+                    return Ok(self.record_exit(status));
+                }
                 Ok(None) if Instant::now() >= deadline => {
                     return Err(MineDockError::ProcessControl(
                         "launch rollback process did not exit within the cleanup bound".into(),
@@ -186,6 +196,14 @@ impl NativeServerProcess {
 
     fn token_matches(&self, token: StopEscalationToken) -> bool {
         token.world_id() == self.world_id && token.session_id() == self.session_id
+    }
+
+    fn wait_for_readers_bounded(&self) {
+        const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+        let deadline = Instant::now() + READER_DRAIN_TIMEOUT;
+        while self.reader_remaining.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 
@@ -265,7 +283,10 @@ impl ServerProcess for NativeServerProcess {
 
     fn try_wait(&mut self) -> Result<Option<ProcessExit>> {
         match self.child.try_wait() {
-            Ok(Some(status)) => Ok(Some(self.record_exit(status))),
+            Ok(Some(status)) => {
+                self.wait_for_readers_bounded();
+                Ok(Some(self.record_exit(status)))
+            }
             Ok(None) => Ok(None),
             Err(error) => Err(MineDockError::Process(format!(
                 "could not query server process: {error}"
@@ -377,8 +398,10 @@ fn spawn_reader<R: Read + Send + 'static>(
     session_id: SessionId,
     sender: SyncSender<RawLogLine>,
     dropped: Arc<Mutex<u64>>,
+    remaining: Arc<AtomicUsize>,
 ) {
     thread::spawn(move || {
+        let _completion = ReaderCompletion(remaining);
         let mut reader = stream;
         let mut chunk = [0_u8; 4096];
         let mut bytes = Vec::with_capacity(MAX_RAW_LOG_LINE_BYTES);
@@ -432,6 +455,14 @@ fn spawn_reader<R: Read + Send + 'static>(
             );
         }
     });
+}
+
+struct ReaderCompletion(Arc<AtomicUsize>);
+
+impl Drop for ReaderCompletion {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn send_raw(sender: &SyncSender<RawLogLine>, dropped: &Arc<Mutex<u64>>, line: RawLogLine) {
@@ -497,6 +528,14 @@ mod tests {
                 ..
             })
         )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(RawLogLine { line, .. }) if line == "fixture final stdout"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::Raw(RawLogLine { line, .. }) if line == "fixture final stderr"
+        )));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -512,6 +551,8 @@ mod tests {
             .read_line(&mut input)
             .expect("fixture stdin");
         assert_eq!(input, "stop\n");
+        println!("fixture final stdout");
+        eprintln!("fixture final stderr");
     }
 
     #[test]
