@@ -1,6 +1,6 @@
 # MVP Definition
 
-> Implementation status: this file defines the target acceptance bar; it is not a claim that the MVP is complete. The current build supports the GPUI World Library, built-in template selection, metadata-only world creation/persistence, explicit EULA confirmation, Start/Stop lifecycle wiring, Java path recovery settings, world details, current-session recent raw logs, and LAN endpoint display/copy. Player events, persistent logs, backups, and packaging remain open. See [../PLAN.md](../PLAN.md) for the live checklist.
+> Implementation status: the current build supports the GPUI World Library, built-in template selection, metadata-only world creation/persistence, explicit EULA confirmation, Start/Stop lifecycle wiring, Java path recovery settings, world details, persisted session raw logs, best-effort player activity, LAN endpoint display/copy, verified ZIP backups with sidecar manifests and per-world history, automatic successful-shutdown backups, sanitized telemetry-free diagnostics, and a portable Windows package workflow. The clean Windows 11 acceptance run remains a manual release gate. See [../PLAN.md](../PLAN.md) and [windows-acceptance.md](windows-acceptance.md).
 
 ## Goal
 
@@ -46,6 +46,10 @@ A Windows user can install MineDock, create one of three Vanilla Java Edition wo
 - persistent world folders
 - local logs
 - automatic safe shutdown backup
+- schema-versioned session records and replayable player activity
+- verified ZIP backup artifact, sidecar manifest with Minecraft version and
+  uncompressed/archive sizes, integrity digests, count retention, per-world
+  history, and restart-visible status
 
 ### Networking
 - local address + port display
@@ -82,7 +86,8 @@ A Windows user can install MineDock, create one of three Vanilla Java Edition wo
 11. UI progresses `Preparing -> Starting -> Running`.
 12. Copy `192.168.x.x:25565`.
 13. Another Java Edition client on LAN connects.
-14. Logs/players update.
+14. Logs and best-effort player activity update; unknown remains visible until
+    the server provides a reliable ready baseline.
 15. Click `Stop`.
 16. Server stops gracefully.
 17. MineDock creates a local backup.
@@ -90,3 +95,7 @@ A Windows user can install MineDock, create one of three Vanilla Java Edition wo
 19. `Sunday Hardcore` remains in the library and can start again.
 
 If this scenario works reliably, MVP is functionally successful.
+
+The session log and backup records must also remain visible after relaunch;
+the clean Windows 11 evidence for this scenario is tracked in
+[windows-acceptance.md](windows-acceptance.md).

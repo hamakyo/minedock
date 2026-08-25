@@ -1,7 +1,48 @@
 //! Native process ownership helpers. These are deliberately app-side.
 
 use minedock_core::{MineDockError, Result};
+use std::path::Path;
 use std::process::{Child, Command};
+
+/// Fail closed before a large download/provision/backup when the native
+/// filesystem can report free space. Non-Windows test hosts do not have the
+/// same Win32 volume semantics, so the portable adapter leaves the check to
+/// the filesystem operation itself.
+pub fn ensure_free_space(path: &Path, required_bytes: u64) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut available = 0_u64;
+        let result = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            return Err(MineDockError::Persistence(format!(
+                "could not determine free disk space for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        if available < required_bytes {
+            return Err(MineDockError::Persistence(format!(
+                "not enough free disk space: need {required_bytes} bytes, have {available}"
+            )));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, required_bytes);
+    }
+    Ok(())
+}
 
 #[cfg(not(windows))]
 #[derive(Debug)]
