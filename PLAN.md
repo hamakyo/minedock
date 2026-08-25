@@ -1,6 +1,6 @@
 # MineDock Implementation Plan
 
-Checklist status reflects code and tests in the repository, not the final MVP acceptance scenario. Phases 0–5 have implementation foundations, and the initial Phase 6 Start/EULA/Stop wiring plus Phase 9 LAN endpoint UX are now present. Logs, backups, and the remaining MVP acceptance work are still open.
+Checklist status reflects code and tests in the repository, not the final MVP acceptance scenario. Phases 0–5 have implementation foundations, and the Phase 6 library now includes Java recovery settings, world details, and a current-session recent-log view. Player events, backups, and the remaining MVP acceptance work are still open.
 
 ## Phase 0 — Stabilize scaffold
 
@@ -47,8 +47,8 @@ Exit:
 - [x] Detect usable Java.
 - [x] Parse `java -version`.
 - [x] Model required Java version from selected Minecraft server version.
-- [ ] Provide actionable failure UI.
-- [ ] Design bundled-runtime provider but do not overbuild it.
+- [x] Provide actionable failure UI with a persisted Java executable path and retry.
+- [x] Design the bundled-runtime provider seam without shipping a bundled download yet.
 
 Exit:
 - App can tell whether a selected server can run.
@@ -89,8 +89,8 @@ Exit:
 - [x] Stop action.
 - [x] Lifecycle indicators.
 - [ ] Player count if known.
-- [ ] World detail panel.
-- [ ] Recent logs.
+- [x] World detail panel.
+- [x] Recent raw logs for the current server session.
 - [x] Disable invalid actions according to state.
 
 Exit:

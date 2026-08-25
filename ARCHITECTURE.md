@@ -127,9 +127,15 @@ ProcessAdapter
 
 Implemented foundations:
 - `VanillaProvider<T, S>` in core, parameterized by transport and path-safety seams;
+- `JavaRuntimeProvider` in core, with system discovery as the current provider and a
+  future bundled-runtime provider as a compatible seam;
 - `UreqTransport` in the app for bounded, redirect-explicit HTTPS;
 - `NativeProcessFactory` / `NativeServerProcess` in the app;
 - `LifecycleSupervisor` in core, parameterized by process, persistence, and lease adapters.
+
+The MVP does not download or unpack a bundled runtime. A future provider can own
+its verified runtime cache and implement `JavaRuntimeProvider`, while the app keeps
+the same Java readiness and launch flow.
 
 Later:
 - `PaperProvider`
@@ -147,7 +153,7 @@ stdout/stderr
     └──────────────▶ reliable process lifecycle events
 ```
 
-Join/leave/death and server-ready parsing belongs to Phase 7 and is not implemented. Raw log text is never the authority for process exit or successful process control.
+The app displays a bounded recent raw-log projection from the active session. Join/leave/death and server-ready parsing belongs to Phase 7 and is not implemented. Raw log text is never the authority for process exit or successful process control.
 
 Lifecycle authority:
 - OS process handle / exit status
@@ -168,13 +174,16 @@ MineDockView (GPUI entity)
 ├─ create-world wizard state
 ├─ EULA confirmation / pending-start state
 ├─ asynchronous Start operation state
+├─ Java settings and recovery state
+├─ selected world detail panel
+├─ bounded recent raw-log cache
 ├─ startup error / Java readiness projection
 └─ AppDataLease for this process lifetime
 ```
 
 At startup the app acquires an exclusive app-data lease, reconciles persisted active lifecycle states to `Failed`, loads the world library, and probes Java off the GPUI event loop. A lease or metadata failure disables mutating actions.
 
-The UI issues create-world commands and now connects Start to explicit EULA acknowledgement, authoritative Vanilla resolution, provisioning, Java readiness, and the existing lifecycle/process adapters. Stop, log presentation, and backup commands remain Phase 6+ integration work even though their core/native foundations exist.
+The UI issues create-world commands and connects Start to explicit EULA acknowledgement, authoritative Vanilla resolution, provisioning, Java readiness, and the existing lifecycle/process adapters. Java recovery accepts an explicit executable path, persists it, and reruns discovery off the GPUI event loop. World details and a bounded recent raw-log view are presentation projections; persistent log files, player parsing, and backup commands remain later integration work.
 
 ## 9. Persistence
 

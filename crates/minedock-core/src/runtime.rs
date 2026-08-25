@@ -563,6 +563,15 @@ pub struct JavaRuntimeDiscovery<P> {
     pub probe: P,
 }
 
+/// A seam for installed or bundled Java runtime providers.
+///
+/// The MVP only ships the system discovery provider. A future bundled-runtime
+/// provider can implement this contract without changing launch orchestration
+/// or the UI projection; it only needs to return the same readiness model.
+pub trait JavaRuntimeProvider {
+    fn readiness(&self) -> JavaReadiness;
+}
+
 impl<P> JavaRuntimeDiscovery<P> {
     pub fn new(config: JavaDiscoveryConfig, required: JavaRequirement, probe: P) -> Self {
         Self {
@@ -587,6 +596,12 @@ impl<P: JavaProbe> JavaRuntimeDiscovery<P> {
             self.required,
             discover_java(&self.config, self.required, &self.probe),
         )
+    }
+}
+
+impl<P: JavaProbe> JavaRuntimeProvider for JavaRuntimeDiscovery<P> {
+    fn readiness(&self) -> JavaReadiness {
+        self.discover()
     }
 }
 

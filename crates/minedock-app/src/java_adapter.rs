@@ -7,8 +7,8 @@
 use crate::native_safety::KillOnDropJob;
 use minedock_core::{
     JAVA_VERSION_OUTPUT_LIMIT, JavaCandidateInspection, JavaDiscoveryConfig, JavaProbe,
-    JavaProbeOutput, JavaReadiness, JavaRequirement, MineDockError, discover_any_java,
-    discover_java,
+    JavaProbeOutput, JavaReadiness, JavaRequirement, JavaRuntimeDiscovery, JavaRuntimeProvider,
+    MineDockError,
 };
 use std::fs;
 use std::io::Read;
@@ -185,28 +185,35 @@ fn receive_bounded(receiver: Receiver<Vec<u8>>, timeout: Duration) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-pub fn discover_java_off_event_loop(required: JavaRequirement) -> Receiver<JavaReadiness> {
+pub fn discover_java_off_event_loop(
+    required: JavaRequirement,
+    configured_path: Option<PathBuf>,
+) -> Receiver<JavaReadiness> {
     let (sender, receiver) = mpsc::channel();
     let mut config = JavaDiscoveryConfig::from_environment();
     // Explicit configured path is a seam for the Settings UI and tests.  It is
     // intentionally resolved before JAVA_HOME and PATH by the core collector.
-    config.configured_path = std::env::var_os("MINEDOCK_JAVA_PATH").map(PathBuf::from);
+    config.configured_path =
+        configured_path.or_else(|| std::env::var_os("MINEDOCK_JAVA_PATH").map(PathBuf::from));
     thread::spawn(move || {
-        let result = discover_java(&config, required, &NativeJavaProbe);
-        let readiness = JavaReadiness::from_discovery(required, result);
+        let provider = JavaRuntimeDiscovery::new(config, required, NativeJavaProbe);
+        let readiness = provider.readiness();
         let _ = sender.send(readiness);
     });
     receiver
 }
 
-pub fn discover_any_java_off_event_loop() -> Receiver<JavaReadiness> {
+pub fn discover_any_java_off_event_loop(
+    configured_path: Option<PathBuf>,
+) -> Receiver<JavaReadiness> {
     let (sender, receiver) = mpsc::channel();
     let mut config = JavaDiscoveryConfig::from_environment();
-    config.configured_path = std::env::var_os("MINEDOCK_JAVA_PATH").map(PathBuf::from);
+    config.configured_path =
+        configured_path.or_else(|| std::env::var_os("MINEDOCK_JAVA_PATH").map(PathBuf::from));
     thread::spawn(move || {
-        let result = discover_any_java(&config, &NativeJavaProbe);
         let required = JavaRequirement::minimum();
-        let _ = sender.send(JavaReadiness::from_discovery(required, result));
+        let provider = JavaRuntimeDiscovery::new(config, required, NativeJavaProbe);
+        let _ = sender.send(provider.readiness());
     });
     receiver
 }

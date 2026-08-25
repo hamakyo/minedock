@@ -1,6 +1,6 @@
 # MVP Definition
 
-> Implementation status: this file defines the target acceptance bar; it is not a claim that the MVP is complete. The current build supports the GPUI World Library, built-in template selection, metadata-only world creation/persistence, explicit EULA confirmation, Start/Stop lifecycle wiring, and LAN endpoint display/copy. Logs/player UX, backups, and packaging remain open. See [../PLAN.md](../PLAN.md) for the live checklist.
+> Implementation status: this file defines the target acceptance bar; it is not a claim that the MVP is complete. The current build supports the GPUI World Library, built-in template selection, metadata-only world creation/persistence, explicit EULA confirmation, Start/Stop lifecycle wiring, Java path recovery settings, world details, current-session recent raw logs, and LAN endpoint display/copy. Player events, persistent logs, backups, and packaging remain open. See [../PLAN.md](../PLAN.md) for the live checklist.
 
 ## Goal
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -20,9 +20,9 @@ use gpui::{
 };
 use minedock_core::{
     CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository, JavaReadiness,
-    JavaRuntime, JsonWorldRepository, LaunchSpec, LifecycleSupervisor, MineDockError,
-    OFFICIAL_EULA_URL, ProcessExit, SessionId, StopEscalationToken, StopOutcome, TemplateCatalog,
-    TemplateId, World, WorldId, WorldLibrary, WorldStatus, normalize_world_name,
+    JavaRuntime, JsonWorldRepository, LaunchSpec, LifecycleSupervisor, LogStream, MineDockError,
+    OFFICIAL_EULA_URL, ProcessExit, ServerEvent, SessionId, StopEscalationToken, StopOutcome,
+    TemplateCatalog, TemplateId, World, WorldId, WorldLibrary, WorldStatus, normalize_world_name,
 };
 
 #[allow(dead_code)]
@@ -44,6 +44,8 @@ type AppLifecycle = LifecycleSupervisor<
 >;
 type LifecyclePollResult = (WorldId, minedock_core::Result<Option<ProcessExit>>);
 type LifecyclePollResults = Vec<LifecyclePollResult>;
+type LifecycleEventResult = (WorldId, minedock_core::Result<Vec<ServerEvent>>);
+type LifecycleEventResults = Vec<LifecycleEventResult>;
 
 struct PreparedLaunch {
     launch_spec: LaunchSpec,
@@ -73,18 +75,31 @@ enum WorldAction {
     None,
 }
 
+const MAX_RECENT_LOG_LINES: usize = 80;
+
+#[derive(Debug, Clone)]
+struct RecentLogLine {
+    stream: LogStream,
+    line: String,
+    truncated: bool,
+}
+
 fn prepare_launch(
     app_data_root: &Path,
     world: &World,
     eula: &FileEulaAcceptanceRepository,
+    configured_java_path: Option<&Path>,
 ) -> minedock_core::Result<PreparedLaunch> {
     let provider = http_transport::production_vanilla_provider(app_data_root.join("downloads"))?;
     let resolved = provider.resolve_version(&world.server.version_selector()?)?;
-    let readiness = java_adapter::discover_java_off_event_loop(resolved.java_requirement)
-        .recv()
-        .map_err(|_| {
-            MineDockError::JavaUnavailable("Java readiness probe did not return a result".into())
-        })?;
+    let readiness = java_adapter::discover_java_off_event_loop(
+        resolved.java_requirement,
+        configured_java_path.map(Path::to_path_buf),
+    )
+    .recv()
+    .map_err(|_| {
+        MineDockError::JavaUnavailable("Java readiness probe did not return a result".into())
+    })?;
     let (runtime, java_status) = select_java_runtime(readiness)?;
     let artifact = provider.acquire_server(&resolved, eula)?;
     let provisioned =
@@ -120,6 +135,7 @@ fn execute_start(
     app_data_root: PathBuf,
     world: World,
     eula: FileEulaAcceptanceRepository,
+    configured_java_path: Option<PathBuf>,
     progress: Sender<StartProgress>,
 ) -> (
     AppLifecycle,
@@ -128,7 +144,12 @@ fn execute_start(
 ) {
     let mut java_status = None;
     let (lifecycle, result) = execute_lifecycle_start(lifecycle, &app_data_root, world.id, || {
-        let prepared = prepare_launch(&app_data_root, &world, &eula)?;
+        let prepared = prepare_launch(
+            &app_data_root,
+            &world,
+            &eula,
+            configured_java_path.as_deref(),
+        )?;
         java_status = Some(prepared.java_status);
         let _ = progress.send(StartProgress::Starting);
         Ok(prepared.launch_spec)
@@ -224,6 +245,7 @@ where
     (lifecycle, result)
 }
 
+#[allow(dead_code)]
 fn execute_lifecycle_poll<P, F, L>(
     mut lifecycle: LifecycleSupervisor<P, F, L>,
     world_ids: impl IntoIterator<Item = WorldId>,
@@ -241,6 +263,40 @@ where
         })
         .collect();
     (lifecycle, results)
+}
+
+fn execute_lifecycle_poll_and_drain<P, F, L>(
+    mut lifecycle: LifecycleSupervisor<P, F, L>,
+    world_ids: impl IntoIterator<Item = WorldId>,
+) -> (
+    LifecycleSupervisor<P, F, L>,
+    LifecyclePollResults,
+    LifecycleEventResults,
+)
+where
+    P: minedock_core::LifecyclePersistence,
+    F: minedock_core::ProcessFactory,
+    L: minedock_core::LifecycleLeaseProvider,
+{
+    let world_ids: Vec<_> = world_ids.into_iter().collect();
+    // Drain before polling. poll_exit removes an exited session from the
+    // supervisor, while the final output still belongs in the detail panel.
+    let events = world_ids
+        .iter()
+        .copied()
+        .map(|world_id| {
+            let result = lifecycle.drain_events(world_id, 64);
+            (world_id, result)
+        })
+        .collect();
+    let results = world_ids
+        .into_iter()
+        .map(|world_id| {
+            let result = lifecycle.poll_exit(world_id);
+            (world_id, result)
+        })
+        .collect();
+    (lifecycle, results, events)
 }
 
 actions!(
@@ -261,6 +317,7 @@ actions!(
         CreateWorldAction,
         CancelWizardAction,
         CancelEulaAction,
+        CancelJavaSettingsAction,
     ]
 );
 
@@ -890,10 +947,14 @@ struct MineDockView {
     catalog: Option<TemplateCatalog>,
     startup_error: Option<String>,
     name_input: Entity<TextInput>,
+    java_path_input: Entity<TextInput>,
     wizard_open: bool,
     selected_template: Option<TemplateId>,
     wizard_error: Option<String>,
     java_status: JavaStatus,
+    java_path: Option<PathBuf>,
+    java_settings_open: bool,
+    java_settings_error: Option<String>,
     eula_open: bool,
     pending_start: Option<WorldId>,
     eula_error: Option<String>,
@@ -906,11 +967,20 @@ struct MineDockView {
     language: Language,
     settings_error: Option<String>,
     world_scroll: ScrollHandle,
+    details_log_scroll: ScrollHandle,
+    selected_world: Option<WorldId>,
+    recent_logs: HashMap<WorldId, VecDeque<RecentLogLine>>,
 }
 
 impl MineDockView {
-    fn new(name_input: Entity<TextInput>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        name_input: Entity<TextInput>,
+        java_path_input: Entity<TextInput>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&name_input, |_, _, cx| cx.notify()).detach();
+        cx.observe(&java_path_input, |_, _, cx| cx.notify())
+            .detach();
         let catalog = match TemplateCatalog::built_in() {
             Ok(catalog) => Some(catalog),
             Err(error) => {
@@ -921,10 +991,14 @@ impl MineDockView {
                     catalog: None,
                     startup_error: Some(format!("Built-in templates could not load: {error}")),
                     name_input,
+                    java_path_input,
                     wizard_open: false,
                     selected_template: None,
                     wizard_error: None,
                     java_status: JavaStatus::Unavailable { reason: None },
+                    java_path: None,
+                    java_settings_open: false,
+                    java_settings_error: None,
                     eula_open: false,
                     pending_start: None,
                     eula_error: None,
@@ -937,11 +1011,15 @@ impl MineDockView {
                     language: Language::English,
                     settings_error: None,
                     world_scroll: ScrollHandle::new(),
+                    details_log_scroll: ScrollHandle::new(),
+                    selected_world: None,
+                    recent_logs: HashMap::new(),
                 };
             }
         };
         let mut startup_error = None;
         let mut language = Language::English;
+        let mut java_path = None;
         let mut settings_error = None;
         let mut app_data_lease = None;
         let mut lifecycle = None;
@@ -951,8 +1029,11 @@ impl MineDockView {
                 match lifecycle_adapter::AppDataLease::acquire(repository.root()) {
                     Ok(lease) => {
                         app_data_lease = Some(lease);
-                        match localization::load_language(repository.root()) {
-                            Ok(value) => language = value,
+                        match localization::load_settings(repository.root()) {
+                            Ok(settings) => {
+                                language = settings.language;
+                                java_path = settings.java_path;
+                            }
                             Err(error) => settings_error = Some(error),
                         }
                         if let Err(error) =
@@ -999,10 +1080,17 @@ impl MineDockView {
         name_input.update(cx, |input, _| {
             input.placeholder = language.text(UiText::NamePlaceholder).into();
         });
+        java_path_input.update(cx, |input, _| {
+            input.placeholder = language.text(UiText::JavaPathPlaceholder).into();
+            if let Some(path) = java_path.as_ref() {
+                input.content = path.to_string_lossy().into_owned().into();
+                input.selected_range = input.content.len()..input.content.len();
+            }
+        });
         // Current-release has not been resolved in the non-mutating library
         // view. Probe for an installed Java only; Start remains disabled until
         // a provider resolves the authoritative Java requirement.
-        let java_receiver = java_adapter::discover_any_java_off_event_loop();
+        let java_receiver = java_adapter::discover_any_java_off_event_loop(java_path.clone());
         cx.spawn(async move |this, cx| {
             let readiness = cx
                 .background_executor()
@@ -1053,10 +1141,14 @@ impl MineDockView {
             catalog,
             startup_error,
             name_input,
+            java_path_input,
             wizard_open: false,
             selected_template,
             wizard_error: None,
             java_status: JavaStatus::Checking,
+            java_path,
+            java_settings_open: false,
+            java_settings_error: None,
             eula_open: false,
             pending_start: None,
             eula_error: None,
@@ -1069,6 +1161,9 @@ impl MineDockView {
             language,
             settings_error,
             world_scroll: ScrollHandle::new(),
+            details_log_scroll: ScrollHandle::new(),
+            selected_world: None,
+            recent_logs: HashMap::new(),
         }
     }
 
@@ -1076,6 +1171,88 @@ impl MineDockView {
         self.library.as_ref().map(|library| {
             FileEulaAcceptanceRepository::new(eula_acceptance_path(library.repository().root()))
         })
+    }
+
+    fn start_java_discovery(&mut self, cx: &mut Context<Self>) {
+        let java_receiver = java_adapter::discover_any_java_off_event_loop(self.java_path.clone());
+        cx.spawn(async move |this, cx| {
+            let readiness = cx
+                .background_executor()
+                .spawn(async move { java_receiver.recv().ok() })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.java_status = readiness.as_ref().map_or(
+                    JavaStatus::Unavailable { reason: None },
+                    JavaStatus::detected_from_readiness,
+                );
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_java_settings(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.java_settings_open = true;
+        self.java_settings_error = None;
+        window.focus(&self.java_path_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_java_settings(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.java_settings_open = false;
+        self.java_settings_error = None;
+        cx.notify();
+    }
+
+    fn save_java_path(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let raw_path = self.java_path_input.read(cx).content.to_string();
+        if raw_path
+            .chars()
+            .any(|character| character == '\0' || character == '\r' || character == '\n')
+        {
+            self.java_settings_error = Some(
+                "The Java path must not contain control characters. Paste a java.exe path and retry."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let configured_path = (!raw_path.trim().is_empty()).then(|| PathBuf::from(raw_path.trim()));
+        let Some(library) = self.library.as_ref() else {
+            self.java_settings_error = Some("MineDock's world library is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(_lease) = self._app_data_lease.as_ref() else {
+            self.java_settings_error = Some("MineDock's app-data lease is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        match localization::save_settings(
+            library.repository().root(),
+            self.language,
+            configured_path.as_deref(),
+        ) {
+            Ok(()) => {
+                self.java_path = configured_path;
+                self.java_status = JavaStatus::Checking;
+                self.java_settings_error = None;
+                self.java_settings_open = false;
+                self.start_java_discovery(cx);
+            }
+            Err(error) => self.java_settings_error = Some(error),
+        }
+        cx.notify();
     }
 
     /// Open the explicit EULA step for a pending Start request. The actual
@@ -1199,6 +1376,28 @@ impl MineDockView {
             && self._lifecycle.is_some()
     }
 
+    fn record_server_events(&mut self, world_id: WorldId, events: Vec<ServerEvent>) {
+        let recent = self.recent_logs.entry(world_id).or_default();
+        for event in events {
+            match event {
+                ServerEvent::Raw(raw) => recent.push_back(RecentLogLine {
+                    stream: raw.stream,
+                    line: raw.line,
+                    truncated: raw.truncated,
+                }),
+                ServerEvent::RawEventsDropped { count } => recent.push_back(RecentLogLine {
+                    stream: LogStream::Stderr,
+                    line: format!("{count} log lines were dropped before the UI could read them"),
+                    truncated: false,
+                }),
+                ServerEvent::Reliable(_) => {}
+            }
+        }
+        while recent.len() > MAX_RECENT_LOG_LINES {
+            let _ = recent.pop_front();
+        }
+    }
+
     fn poll_exit_once(&mut self, cx: &mut Context<Self>) {
         let pending_force_stop_world = self
             .pending_force_stop
@@ -1234,15 +1433,23 @@ impl MineDockView {
         self.active_operation = Some(LifecycleOperation::Polling);
         let worker = cx
             .background_executor()
-            .spawn(async move { execute_lifecycle_poll(lifecycle, world_ids) });
+            .spawn(async move { execute_lifecycle_poll_and_drain(lifecycle, world_ids) });
         cx.spawn(async move |this, cx| {
-            let (lifecycle, results) = worker.await;
+            let (lifecycle, results, event_results) = worker.await;
             let _ = this.update(cx, |view, cx| {
                 view._lifecycle = Some(lifecycle);
                 let mut errors = Vec::new();
                 let mut should_reload = false;
                 let mut late_stop_completed = false;
                 let mut pending_force_stop_is_active = false;
+                for (world_id, result) in event_results {
+                    match result {
+                        Ok(events) => view.record_server_events(world_id, events),
+                        Err(error) => errors.push(format!(
+                            "Could not read recent logs for world {world_id}: {error}"
+                        )),
+                    }
+                }
                 let pending_force_stop_world = view
                     .pending_force_stop
                     .as_ref()
@@ -1370,6 +1577,7 @@ impl MineDockView {
             cx.notify();
             return;
         };
+        let configured_java_path = self.java_path.clone();
         let Some(lifecycle) = self._lifecycle.take() else {
             self.lifecycle_error = Some("The lifecycle runtime is unavailable.".into());
             cx.notify();
@@ -1386,7 +1594,14 @@ impl MineDockView {
         let completed = Arc::new(AtomicBool::new(false));
         let completed_by_worker = completed.clone();
         let worker = cx.background_executor().spawn(async move {
-            let result = execute_start(lifecycle, app_data_root, world, eula, progress_sender);
+            let result = execute_start(
+                lifecycle,
+                app_data_root,
+                world,
+                eula,
+                configured_java_path,
+                progress_sender,
+            );
             completed_by_worker.store(true, Ordering::Release);
             result
         });
@@ -1620,6 +1835,34 @@ impl MineDockView {
         cx.notify();
     }
 
+    fn open_world_details(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .library
+            .as_ref()
+            .is_some_and(|library| library.get(world_id).is_some())
+        {
+            self.selected_world = Some(world_id);
+            self.clipboard_notice = None;
+            cx.notify();
+        }
+    }
+
+    fn close_world_details(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_world = None;
+        cx.notify();
+    }
+
     fn set_language(
         &mut self,
         language: Language,
@@ -1637,6 +1880,9 @@ impl MineDockView {
             self.language = language;
             self.name_input.update(cx, |input, _| {
                 input.placeholder = language.text(UiText::NamePlaceholder).into();
+            });
+            self.java_path_input.update(cx, |input, _| {
+                input.placeholder = language.text(UiText::JavaPathPlaceholder).into();
             });
         }
         if let (Some(library), Some(_lease)) =
@@ -1761,6 +2007,17 @@ impl MineDockView {
         self.close_wizard(cx);
     }
 
+    fn cancel_java_settings_action(
+        &mut self,
+        _: &CancelJavaSettingsAction,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.java_settings_open = false;
+        self.java_settings_error = None;
+        cx.notify();
+    }
+
     fn select_template(
         &mut self,
         template_id: TemplateId,
@@ -1852,6 +2109,7 @@ impl MineDockView {
         let language = self.language;
         let can_mutate = self.can_mutate();
         let can_change_language = self.can_change_language();
+        let java_unavailable = matches!(self.java_status, JavaStatus::Unavailable { .. });
         div()
             .flex()
             .justify_between()
@@ -1862,11 +2120,27 @@ impl MineDockView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("MineDock"),
             )
-            .child(div().text_color(rgb(0x9CA3AF)).child(format!(
-                "{}  ·  {}",
-                language.text(UiText::LocalLibrary),
-                language.java_status(&self.java_status)
-            )))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().text_color(rgb(0x9CA3AF)).child(format!(
+                        "{}  ·  {}",
+                        language.text(UiText::LocalLibrary),
+                        language.java_status(&self.java_status)
+                    )))
+                    .child(button(
+                        language.text(UiText::JavaSettings),
+                        if java_unavailable {
+                            rgb(0x8B4A4A)
+                        } else {
+                            rgb(0x303A50)
+                        },
+                        self.can_mutate(),
+                        cx.listener(Self::open_java_settings),
+                    )),
+            )
             .child(
                 div()
                     .flex()
@@ -1995,6 +2269,9 @@ impl MineDockView {
                     WorldAction::ForceStop => true,
                     WorldAction::None => false,
                 };
+                let details_handler = cx.listener(move |view, event, window, cx| {
+                    view.open_world_details(world_id, event, window, cx)
+                });
                 cards = cards.child(world_card(
                     &world,
                     status,
@@ -2002,6 +2279,7 @@ impl MineDockView {
                     action_enabled,
                     connection,
                     self.language,
+                    details_handler,
                     cx.listener(move |view, event, window, cx| match action {
                         WorldAction::Start => view.start_world(world_id, event, window, cx),
                         WorldAction::Stop => view.stop_world(world_id, event, window, cx),
@@ -2034,6 +2312,233 @@ impl MineDockView {
             .overflow_y_scroll()
             .track_scroll(&self.world_scroll)
             .child(cards)
+    }
+
+    fn render_world_details(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(world_id) = self.selected_world else {
+            return div();
+        };
+        let Some(world) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.get(world_id))
+            .cloned()
+        else {
+            self.selected_world = None;
+            return div();
+        };
+        let language = self.language;
+        let status = self.displayed_status(&world);
+        let mut log_items = div().flex().flex_col().gap(px(4.));
+        if let Some(lines) = self.recent_logs.get(&world_id) {
+            for line in lines {
+                let stream = match line.stream {
+                    LogStream::Stdout => language.text(UiText::Stdout),
+                    LogStream::Stderr => language.text(UiText::Stderr),
+                };
+                let truncated = if line.truncated { " …" } else { "" };
+                log_items = log_items.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xC7CEDB))
+                        .child(format!("[{stream}] {}{truncated}", line.line)),
+                );
+            }
+        }
+        let has_logs = self
+            .recent_logs
+            .get(&world_id)
+            .is_some_and(|lines| !lines.is_empty());
+        if !has_logs {
+            log_items = log_items.child(
+                div()
+                    .text_color(rgb(0x7E8797))
+                    .child(language.text(UiText::NoRecentLogs)),
+            );
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0xCC0D1016))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(680.))
+                    .p(px(24.))
+                    .rounded(px(14.))
+                    .bg(rgb(0x202631))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_size(px(22.)).child(world.name.clone()))
+                            .child(button(
+                                language.text(UiText::Close),
+                                rgb(0x303744),
+                                true,
+                                cx.listener(Self::close_world_details),
+                            )),
+                    )
+                    .child(div().text_color(rgb(0x9CA3AF)).child(format!(
+                            "{} · {}",
+                            language.template_name(
+                                world.template_id.as_str(),
+                                world.template_id.as_str()
+                            ),
+                            language.vanilla_version(&world.server.version)
+                        )))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(detail_item(
+                                language.text(UiText::WorldStatusLabel),
+                                language.status(status).to_owned(),
+                            ))
+                            .child(detail_item(
+                                language.text(UiText::Version),
+                                world.server.version.clone(),
+                            ))
+                            .child(detail_item(
+                                language.text(UiText::Port),
+                                world.server.port.to_string(),
+                            ))
+                            .child(detail_item(
+                                language.text(UiText::MaxPlayers),
+                                world.server.max_players.to_string(),
+                            ))
+                            .child(detail_item(
+                                language.text(UiText::Whitelist),
+                                world.server.whitelist.to_string(),
+                            ))
+                            .child(detail_item(
+                                language.text(UiText::OnlineMode),
+                                world.server.online_mode.to_string(),
+                            ))
+                            .child(detail_item(
+                                language.text(UiText::GameMode),
+                                language.game_mode(world.settings.gamemode).to_owned(),
+                            ))
+                            .child(detail_item(
+                                language.text(UiText::Difficulty),
+                                language.difficulty(world.settings.difficulty).to_owned(),
+                            )),
+                    )
+                    .child(detail_item(
+                        language.text(UiText::DataPath),
+                        world.data_path.display().to_string(),
+                    ))
+                    .child(detail_item(
+                        language.text(UiText::Created),
+                        world.created_at.to_rfc3339(),
+                    ))
+                    .child(detail_item(
+                        language.text(UiText::LastPlayed),
+                        world.last_played_at.map_or_else(
+                            || language.text(UiText::Never).to_owned(),
+                            |value| value.to_rfc3339(),
+                        ),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .text_color(rgb(0xE7EEFF))
+                            .child(language.text(UiText::RecentLogs)),
+                    )
+                    .child(
+                        div()
+                            .id("details-recent-logs")
+                            .h(px(190.))
+                            .p(px(8.))
+                            .rounded(px(8.))
+                            .bg(rgb(0x11151D))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.details_log_scroll)
+                            .child(log_items),
+                    ),
+            )
+    }
+
+    fn render_java_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0xCC0D1016))
+            .key_context("MineDockJavaSettings")
+            .on_action(cx.listener(Self::cancel_java_settings_action))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(620.))
+                    .p(px(24.))
+                    .rounded(px(14.))
+                    .bg(rgb(0x202631))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .child(
+                        div()
+                            .text_size(px(22.))
+                            .child(language.text(UiText::JavaSettings)),
+                    )
+                    .child(
+                        div()
+                            .text_color(
+                                if matches!(self.java_status, JavaStatus::Unavailable { .. }) {
+                                    rgb(0xFFB4B4)
+                                } else {
+                                    rgb(0xB9C0CC)
+                                },
+                            )
+                            .child(language.java_status(&self.java_status)),
+                    )
+                    .child(label(language.text(UiText::JavaPath)))
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(7.))
+                            .bg(rgb(0x11151D))
+                            .border_1()
+                            .border_color(rgb(0x424B5B))
+                            .child(self.java_path_input.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0x91A0B7))
+                            .child(language.text(UiText::JavaSettingsHint)),
+                    )
+                    .when_some(self.java_settings_error.clone(), |element, error| {
+                        element.child(div().text_color(rgb(0xFF9B9B)).child(error))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(10.))
+                            .child(button(
+                                language.text(UiText::Close),
+                                rgb(0x303744),
+                                true,
+                                cx.listener(Self::close_java_settings),
+                            ))
+                            .child(button(
+                                language.text(UiText::SaveAndRetry),
+                                rgb(0x3D5A88),
+                                self.can_mutate(),
+                                cx.listener(Self::save_java_path),
+                            )),
+                    ),
+            )
     }
 
     fn render_wizard(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2273,12 +2778,36 @@ impl Render for MineDockView {
         if self.eula_open {
             content = content.child(self.render_eula_dialog(cx));
         }
+        if self.selected_world.is_some() {
+            content = content.child(self.render_world_details(cx));
+        }
+        if self.java_settings_open {
+            content = content.child(self.render_java_settings(cx));
+        }
         content
     }
 }
 
 fn label(text: &'static str) -> impl IntoElement {
     div().text_color(rgb(0xB9C0CC)).child(text)
+}
+
+fn detail_item(label: &'static str, value: String) -> impl IntoElement {
+    div()
+        .min_w(px(120.))
+        .p(px(8.))
+        .rounded(px(7.))
+        .bg(rgb(0x292E38))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(0x8D98AA))
+                .child(label),
+        )
+        .child(div().text_color(rgb(0xE7EEFF)).child(value))
 }
 
 fn button(
@@ -2345,6 +2874,7 @@ fn connection_endpoint_row(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn world_card(
     world: &World,
     status: WorldStatus,
@@ -2352,6 +2882,7 @@ fn world_card(
     action_enabled: bool,
     connection: impl IntoElement,
     language: Language,
+    details_handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     action_handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let (indicator, status_color) = match status {
@@ -2427,7 +2958,26 @@ fn world_card(
                         .child(language.text(UiText::WorldDescription)),
                 ),
         )
-        .child(action)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap(px(8.))
+                .child(action)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("world-details-{}", world.id)))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(7.))
+                        .bg(rgb(0x292E38))
+                        .text_color(rgb(0xC9D4E8))
+                        .child(language.text(UiText::Details))
+                        .focusable()
+                        .on_click(details_handler),
+                ),
+        )
 }
 
 fn main() {
@@ -2448,6 +2998,11 @@ fn main() {
             KeyBinding::new("enter", CreateWorldAction, Some("TextInput")),
             KeyBinding::new("escape", CancelWizardAction, Some("MineDockWizard")),
             KeyBinding::new("escape", CancelEulaAction, Some("MineDockEula")),
+            KeyBinding::new(
+                "escape",
+                CancelJavaSettingsAction,
+                Some("MineDockJavaSettings"),
+            ),
         ]);
         let bounds = Bounds::centered(None, size(px(900.), px(650.)), cx);
         cx.open_window(
@@ -2458,7 +3013,8 @@ fn main() {
             },
             |_, cx| {
                 let name_input = cx.new(TextInput::new);
-                cx.new(|cx| MineDockView::new(name_input, cx))
+                let java_path_input = cx.new(TextInput::new);
+                cx.new(|cx| MineDockView::new(name_input, java_path_input, cx))
             },
         )
         .expect("failed to open MineDock window");

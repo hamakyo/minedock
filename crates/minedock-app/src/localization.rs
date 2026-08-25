@@ -1,10 +1,10 @@
 use crate::network::LanAddressUnavailableReason;
 use atomic_write_file::AtomicWriteFile;
-use minedock_core::{JavaReadiness, JavaUnavailableReason, WorldStatus};
+use minedock_core::{Difficulty, GameMode, JavaReadiness, JavaUnavailableReason, WorldStatus};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SETTINGS_FILE: &str = "settings.json";
 const SETTINGS_SCHEMA_VERSION: u16 = 1;
@@ -59,6 +59,29 @@ pub enum UiText {
     StartupError,
     SettingsError,
     WorldDescription,
+    JavaSettings,
+    JavaPath,
+    JavaPathPlaceholder,
+    JavaSettingsHint,
+    SaveAndRetry,
+    Close,
+    Details,
+    RecentLogs,
+    NoRecentLogs,
+    WorldStatusLabel,
+    Version,
+    Port,
+    MaxPlayers,
+    Whitelist,
+    OnlineMode,
+    GameMode,
+    Difficulty,
+    DataPath,
+    Created,
+    LastPlayed,
+    Never,
+    Stdout,
+    Stderr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +136,14 @@ impl JavaStatus {
 struct AppSettings {
     schema_version: u16,
     language: Language,
+    #[serde(default)]
+    java_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppSettingsState {
+    pub language: Language,
+    pub java_path: Option<PathBuf>,
 }
 
 impl Language {
@@ -222,6 +253,60 @@ impl Language {
             (Self::Japanese, UiText::WorldDescription) => {
                 "バニラのリリース、Java、サーバーファイルは起動時に準備されます"
             }
+            (Self::English, UiText::JavaSettings) => "Java settings",
+            (Self::Japanese, UiText::JavaSettings) => "Java設定",
+            (Self::English, UiText::JavaPath) => "Java executable path (optional)",
+            (Self::Japanese, UiText::JavaPath) => "Java実行ファイルのパス（任意）",
+            (Self::English, UiText::JavaPathPlaceholder) => "Leave empty to use JAVA_HOME or PATH",
+            (Self::Japanese, UiText::JavaPathPlaceholder) => {
+                "空欄ならJAVA_HOMEまたはPATHから探します"
+            }
+            (Self::English, UiText::JavaSettingsHint) => {
+                "Paste the path to a compatible java.exe, then save and retry."
+            }
+            (Self::Japanese, UiText::JavaSettingsHint) => {
+                "互換性のあるjava.exeのパスを貼り付けて、保存して再試行してください。"
+            }
+            (Self::English, UiText::SaveAndRetry) => "Save & Retry",
+            (Self::Japanese, UiText::SaveAndRetry) => "保存して再試行",
+            (Self::English, UiText::Close) => "Close",
+            (Self::Japanese, UiText::Close) => "閉じる",
+            (Self::English, UiText::Details) => "DETAILS",
+            (Self::Japanese, UiText::Details) => "詳細",
+            (Self::English, UiText::RecentLogs) => "Recent logs",
+            (Self::Japanese, UiText::RecentLogs) => "最近のログ",
+            (Self::English, UiText::NoRecentLogs) => {
+                "No recent server output has been collected yet."
+            }
+            (Self::Japanese, UiText::NoRecentLogs) => "最近のサーバー出力はまだありません。",
+            (Self::English, UiText::WorldStatusLabel) => "Status",
+            (Self::Japanese, UiText::WorldStatusLabel) => "状態",
+            (Self::English, UiText::Version) => "Version",
+            (Self::Japanese, UiText::Version) => "バージョン",
+            (Self::English, UiText::Port) => "Port",
+            (Self::Japanese, UiText::Port) => "ポート",
+            (Self::English, UiText::MaxPlayers) => "Max players",
+            (Self::Japanese, UiText::MaxPlayers) => "最大人数",
+            (Self::English, UiText::Whitelist) => "Whitelist",
+            (Self::Japanese, UiText::Whitelist) => "ホワイトリスト",
+            (Self::English, UiText::OnlineMode) => "Online mode",
+            (Self::Japanese, UiText::OnlineMode) => "オンラインモード",
+            (Self::English, UiText::GameMode) => "Game mode",
+            (Self::Japanese, UiText::GameMode) => "ゲームモード",
+            (Self::English, UiText::Difficulty) => "Difficulty",
+            (Self::Japanese, UiText::Difficulty) => "難易度",
+            (Self::English, UiText::DataPath) => "Data path",
+            (Self::Japanese, UiText::DataPath) => "データパス",
+            (Self::English, UiText::Created) => "Created",
+            (Self::Japanese, UiText::Created) => "作成日時",
+            (Self::English, UiText::LastPlayed) => "Last played",
+            (Self::Japanese, UiText::LastPlayed) => "最終プレイ",
+            (Self::English, UiText::Never) => "Never",
+            (Self::Japanese, UiText::Never) => "未プレイ",
+            (Self::English, UiText::Stdout) => "stdout",
+            (Self::Japanese, UiText::Stdout) => "標準出力",
+            (Self::English, UiText::Stderr) => "stderr",
+            (Self::Japanese, UiText::Stderr) => "標準エラー",
         }
     }
 
@@ -401,14 +486,39 @@ impl Language {
             format!("Settings error — {error}")
         }
     }
+
+    pub fn game_mode(self, mode: GameMode) -> &'static str {
+        match (self, mode) {
+            (Self::English, GameMode::Survival) => "Survival",
+            (Self::Japanese, GameMode::Survival) => "サバイバル",
+            (Self::English, GameMode::Creative) => "Creative",
+            (Self::Japanese, GameMode::Creative) => "クリエイティブ",
+        }
+    }
+
+    pub fn difficulty(self, difficulty: Difficulty) -> &'static str {
+        match (self, difficulty) {
+            (Self::English, Difficulty::Peaceful) => "Peaceful",
+            (Self::Japanese, Difficulty::Peaceful) => "ピースフル",
+            (Self::English, Difficulty::Easy) => "Easy",
+            (Self::Japanese, Difficulty::Easy) => "イージー",
+            (Self::English, Difficulty::Normal) => "Normal",
+            (Self::Japanese, Difficulty::Normal) => "ノーマル",
+            (Self::English, Difficulty::Hard) => "Hard",
+            (Self::Japanese, Difficulty::Hard) => "ハード",
+        }
+    }
 }
 
-pub fn load_language(root: &Path) -> Result<Language, String> {
+pub fn load_settings(root: &Path) -> Result<AppSettingsState, String> {
     let path = root.join(SETTINGS_FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Language::default());
+            return Ok(AppSettingsState {
+                language: Language::default(),
+                java_path: None,
+            });
         }
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
@@ -420,16 +530,29 @@ pub fn load_language(root: &Path) -> Result<Language, String> {
             settings.schema_version
         ));
     }
-    Ok(settings.language)
+    Ok(AppSettingsState {
+        language: settings.language,
+        java_path: settings.java_path.map(PathBuf::from),
+    })
 }
 
-pub fn save_language(root: &Path, language: Language) -> Result<(), String> {
+#[allow(dead_code)]
+pub fn load_language(root: &Path) -> Result<Language, String> {
+    load_settings(root).map(|settings| settings.language)
+}
+
+pub fn save_settings(
+    root: &Path,
+    language: Language,
+    java_path: Option<&Path>,
+) -> Result<(), String> {
     fs::create_dir_all(root)
         .map_err(|error| format!("could not create app-data root {}: {error}", root.display()))?;
     let path = root.join(SETTINGS_FILE);
     let bytes = serde_json::to_vec_pretty(&AppSettings {
         schema_version: SETTINGS_SCHEMA_VERSION,
         language,
+        java_path: java_path.map(|path| path.to_string_lossy().into_owned()),
     })
     .map_err(|error| format!("could not serialize settings: {error}"))?;
     let mut file = AtomicWriteFile::open(&path)
@@ -443,9 +566,16 @@ pub fn save_language(root: &Path, language: Language) -> Result<(), String> {
     Ok(())
 }
 
+pub fn save_language(root: &Path, language: Language) -> Result<(), String> {
+    let java_path = load_settings(root)?.java_path;
+    save_settings(root, language, java_path.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{JavaStatus, Language, UiText, load_language, save_language};
+    use super::{
+        JavaStatus, Language, UiText, load_language, load_settings, save_language, save_settings,
+    };
     use crate::network::LanAddressUnavailableReason;
     use minedock_core::{JavaUnavailableReason, WorldStatus};
     use tempfile::TempDir;
@@ -469,6 +599,24 @@ mod tests {
         );
         assert_eq!(Language::Japanese.text(UiText::Worlds), "ワールド");
         assert_eq!(Language::Japanese.status(WorldStatus::Running), "稼働中");
+    }
+
+    #[test]
+    fn java_path_setting_round_trips_without_losing_language() {
+        let root = TempDir::new().expect("temporary settings root");
+        let java = std::path::Path::new(r"C:\Java\bin\java.exe");
+        save_settings(root.path(), Language::Japanese, Some(java)).expect("save settings");
+        let settings = load_settings(root.path()).expect("load settings");
+        assert_eq!(settings.language, Language::Japanese);
+        assert_eq!(settings.java_path.as_deref(), Some(java));
+        save_language(root.path(), Language::English).expect("save language");
+        assert_eq!(
+            load_settings(root.path())
+                .expect("reload settings")
+                .java_path
+                .as_deref(),
+            Some(java)
+        );
     }
 
     #[test]
