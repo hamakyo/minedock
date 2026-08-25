@@ -14,8 +14,9 @@ use std::{
 use gpui::{
     App, Application, Bounds, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
-    PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
-    WindowBounds, WindowOptions, actions, div, fill, prelude::*, px, relative, rgb, rgba, size,
+    PaintQuad, Pixels, Point, ScrollHandle, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, Window, WindowBounds, WindowOptions, actions, div, fill, prelude::*, px,
+    relative, rgb, rgba, size,
 };
 use minedock_core::{
     CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository, JavaReadiness,
@@ -28,10 +29,12 @@ use minedock_core::{
 mod http_transport;
 mod java_adapter;
 mod lifecycle_adapter;
+mod localization;
 mod native_process;
 mod native_safety;
 mod network;
 
+use localization::{JavaStatus, Language, UiAction, UiText};
 use network::LanAddressState;
 
 type AppLifecycle = LifecycleSupervisor<
@@ -44,7 +47,7 @@ type LifecyclePollResults = Vec<LifecyclePollResult>;
 
 struct PreparedLaunch {
     launch_spec: LaunchSpec,
-    java_status: String,
+    java_status: JavaStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,11 +96,14 @@ fn prepare_launch(
     })
 }
 
-fn select_java_runtime(readiness: JavaReadiness) -> minedock_core::Result<(JavaRuntime, String)> {
-    let java_status = readiness.status_text();
-    let runtime = readiness.runtime.ok_or_else(|| {
+fn select_java_runtime(
+    readiness: JavaReadiness,
+) -> minedock_core::Result<(JavaRuntime, JavaStatus)> {
+    let java_status = JavaStatus::from_readiness(&readiness);
+    let runtime = readiness.runtime.clone().ok_or_else(|| {
+        let status_text = readiness.status_text();
         MineDockError::JavaUnavailable(format!(
-            "{java_status}. Choose a compatible Java executable and retry."
+            "{status_text}. Choose a compatible Java executable and retry."
         ))
     })?;
     Ok((runtime, java_status))
@@ -117,7 +123,7 @@ fn execute_start(
     progress: Sender<StartProgress>,
 ) -> (
     AppLifecycle,
-    Option<String>,
+    Option<JavaStatus>,
     minedock_core::Result<SessionId>,
 ) {
     let mut java_status = None;
@@ -887,7 +893,7 @@ struct MineDockView {
     wizard_open: bool,
     selected_template: Option<TemplateId>,
     wizard_error: Option<String>,
-    java_status: String,
+    java_status: JavaStatus,
     eula_open: bool,
     pending_start: Option<WorldId>,
     eula_error: Option<String>,
@@ -897,6 +903,9 @@ struct MineDockView {
     lifecycle_error: Option<String>,
     lan_address_state: LanAddressState,
     clipboard_notice: Option<String>,
+    language: Language,
+    settings_error: Option<String>,
+    world_scroll: ScrollHandle,
 }
 
 impl MineDockView {
@@ -915,7 +924,7 @@ impl MineDockView {
                     wizard_open: false,
                     selected_template: None,
                     wizard_error: None,
-                    java_status: "Java readiness unavailable".into(),
+                    java_status: JavaStatus::Unavailable { reason: None },
                     eula_open: false,
                     pending_start: None,
                     eula_error: None,
@@ -925,10 +934,15 @@ impl MineDockView {
                     lifecycle_error: None,
                     lan_address_state: LanAddressState::Checking,
                     clipboard_notice: None,
+                    language: Language::English,
+                    settings_error: None,
+                    world_scroll: ScrollHandle::new(),
                 };
             }
         };
         let mut startup_error = None;
+        let mut language = Language::English;
+        let mut settings_error = None;
         let mut app_data_lease = None;
         let mut lifecycle = None;
         let library = match resolve_app_data_root() {
@@ -937,6 +951,10 @@ impl MineDockView {
                 match lifecycle_adapter::AppDataLease::acquire(repository.root()) {
                     Ok(lease) => {
                         app_data_lease = Some(lease);
+                        match localization::load_language(repository.root()) {
+                            Ok(value) => language = value,
+                            Err(error) => settings_error = Some(error),
+                        }
                         if let Err(error) =
                             lifecycle_adapter::JsonLifecyclePersistence::recover_startup(
                                 &repository,
@@ -978,6 +996,9 @@ impl MineDockView {
             .as_ref()
             .and_then(|catalog| catalog.templates().first())
             .map(|template| template.id.clone());
+        name_input.update(cx, |input, _| {
+            input.placeholder = language.text(UiText::NamePlaceholder).into();
+        });
         // Current-release has not been resolved in the non-mutating library
         // view. Probe for an installed Java only; Start remains disabled until
         // a provider resolves the authoritative Java requirement.
@@ -989,15 +1010,7 @@ impl MineDockView {
                 .await;
             if let Some(readiness) = readiness {
                 let _ = this.update(cx, |view, cx| {
-                    view.java_status = readiness.runtime.as_ref().map_or_else(
-                        || readiness.status_text(),
-                        |runtime| {
-                            format!(
-                                "Java detected (major {}; release check pending)",
-                                runtime.version.major
-                            )
-                        },
-                    );
+                    view.java_status = JavaStatus::detected_from_readiness(&readiness);
                     cx.notify();
                 });
             }
@@ -1043,7 +1056,7 @@ impl MineDockView {
             wizard_open: false,
             selected_template,
             wizard_error: None,
-            java_status: "Checking Java readiness…".into(),
+            java_status: JavaStatus::Checking,
             eula_open: false,
             pending_start: None,
             eula_error: None,
@@ -1053,6 +1066,9 @@ impl MineDockView {
             lifecycle_error: None,
             lan_address_state: LanAddressState::Checking,
             clipboard_notice: None,
+            language,
+            settings_error,
+            world_scroll: ScrollHandle::new(),
         }
     }
 
@@ -1600,8 +1616,42 @@ impl MineDockView {
         cx: &mut Context<Self>,
     ) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(endpoint.clone()));
-        self.clipboard_notice = Some(format!("Copied {endpoint} to clipboard."));
+        self.clipboard_notice = Some(self.language.copy_notice(&endpoint));
         cx.notify();
+    }
+
+    fn set_language(
+        &mut self,
+        language: Language,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_change_language() {
+            return;
+        }
+        if self.language == language && self.settings_error.is_none() {
+            return;
+        }
+        if self.language != language {
+            self.language = language;
+            self.name_input.update(cx, |input, _| {
+                input.placeholder = language.text(UiText::NamePlaceholder).into();
+            });
+        }
+        if let (Some(library), Some(_lease)) =
+            (self.library.as_ref(), self._app_data_lease.as_ref())
+        {
+            match localization::save_language(library.repository().root(), language) {
+                Ok(()) => self.settings_error = None,
+                Err(error) => self.settings_error = Some(error),
+            }
+        }
+        cx.notify();
+    }
+
+    fn can_change_language(&self) -> bool {
+        self.library.is_some() && self._app_data_lease.is_some()
     }
 
     fn render_connection(
@@ -1616,12 +1666,16 @@ impl MineDockView {
             return section;
         }
 
-        section = section.child(div().text_color(rgb(0xB9C0CC)).child("LAN connection"));
+        section = section.child(
+            div()
+                .text_color(rgb(0xB9C0CC))
+                .child(self.language.text(UiText::LanConnection)),
+        );
         if port == 0 {
             return section.child(
                 div()
                     .text_color(rgb(0xFFB4B4))
-                    .child("Connection endpoint unavailable: configured server-port is invalid."),
+                    .child(self.language.text(UiText::EndpointInvalid)),
             );
         }
 
@@ -1629,12 +1683,12 @@ impl MineDockView {
             LanAddressState::Checking => section.child(
                 div()
                     .text_color(rgb(0x91A0B7))
-                    .child("Checking for usable LAN IPv4 addresses…"),
+                    .child(self.language.text(UiText::CheckingLan)),
             ),
             LanAddressState::Unavailable(reason) => section.child(
                 div()
                     .text_color(rgb(0xFFB4B4))
-                    .child(format!("Connection endpoint unavailable: {reason}")),
+                    .child(self.language.lan_unavailable(&reason)),
             ),
             LanAddressState::Available(candidate) => {
                 let endpoint = candidate
@@ -1648,13 +1702,16 @@ impl MineDockView {
                     world_id,
                     &endpoint,
                     &candidate.interface_name,
+                    self.language,
                     handler,
                 ))
             }
             LanAddressState::Ambiguous(candidates) => {
-                section = section.child(div().text_color(rgb(0xF0C674)).child(
-                    "Multiple LAN addresses found. Choose the interface your friend can reach:",
-                ));
+                section = section.child(
+                    div()
+                        .text_color(rgb(0xF0C674))
+                        .child(self.language.text(UiText::MultipleLan)),
+                );
                 for candidate in candidates {
                     let endpoint = candidate
                         .endpoint(port)
@@ -1667,6 +1724,7 @@ impl MineDockView {
                         world_id,
                         &endpoint,
                         &candidate.interface_name,
+                        self.language,
                         handler,
                     ));
                 }
@@ -1791,6 +1849,9 @@ impl MineDockView {
     }
 
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
+        let can_mutate = self.can_mutate();
+        let can_change_language = self.can_change_language();
         div()
             .flex()
             .justify_between()
@@ -1801,31 +1862,113 @@ impl MineDockView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("MineDock"),
             )
+            .child(div().text_color(rgb(0x9CA3AF)).child(format!(
+                "{}  ·  {}",
+                language.text(UiText::LocalLibrary),
+                language.java_status(&self.java_status)
+            )))
             .child(
                 div()
-                    .text_color(rgb(0x9CA3AF))
-                    .child(format!("Local library  ·  {}", self.java_status)),
-            )
-            .child(
-                div()
-                    .id("new-world")
-                    .px(px(14.))
-                    .py(px(8.))
-                    .rounded(px(8.))
-                    .bg(if self.can_mutate() {
-                        rgb(0x34415C)
-                    } else {
-                        rgb(0x252932)
-                    })
-                    .text_color(if self.can_mutate() {
-                        rgb(0xE7EEFF)
-                    } else {
-                        rgb(0x737985)
-                    })
-                    .child("+ New World")
-                    .when(self.can_mutate(), |element| {
-                        element.focusable().on_click(cx.listener(Self::open_wizard))
-                    }),
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0x9CA3AF))
+                                    .child(language.text(UiText::Language)),
+                            )
+                            .child(
+                                div()
+                                    .id("language-english")
+                                    .px(px(7.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .bg(if language == Language::English {
+                                        rgb(0x3D5A88)
+                                    } else if can_change_language {
+                                        rgb(0x292E38)
+                                    } else {
+                                        rgb(0x252932)
+                                    })
+                                    .text_color(if can_change_language {
+                                        rgb(0xE7EEFF)
+                                    } else {
+                                        rgb(0x737985)
+                                    })
+                                    .child(language.text(UiText::English))
+                                    .when(can_change_language, |element| {
+                                        element.focusable().on_click(cx.listener(
+                                            |view, event, window, cx| {
+                                                view.set_language(
+                                                    Language::English,
+                                                    event,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("language-japanese")
+                                    .px(px(7.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .bg(if language == Language::Japanese {
+                                        rgb(0x3D5A88)
+                                    } else if can_change_language {
+                                        rgb(0x292E38)
+                                    } else {
+                                        rgb(0x252932)
+                                    })
+                                    .text_color(if can_change_language {
+                                        rgb(0xE7EEFF)
+                                    } else {
+                                        rgb(0x737985)
+                                    })
+                                    .child(language.text(UiText::Japanese))
+                                    .when(can_change_language, |element| {
+                                        element.focusable().on_click(cx.listener(
+                                            |view, event, window, cx| {
+                                                view.set_language(
+                                                    Language::Japanese,
+                                                    event,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("new-world")
+                            .px(px(14.))
+                            .py(px(8.))
+                            .rounded(px(8.))
+                            .bg(if can_mutate {
+                                rgb(0x34415C)
+                            } else {
+                                rgb(0x252932)
+                            })
+                            .text_color(if can_mutate {
+                                rgb(0xE7EEFF)
+                            } else {
+                                rgb(0x737985)
+                            })
+                            .child(language.text(UiText::NewWorld))
+                            .when(can_mutate, |element| {
+                                element.focusable().on_click(cx.listener(Self::open_wizard))
+                            }),
+                    ),
             )
     }
 
@@ -1858,6 +2001,7 @@ impl MineDockView {
                     action,
                     action_enabled,
                     connection,
+                    self.language,
                     cx.listener(move |view, event, window, cx| match action {
                         WorldAction::Start => view.start_world(world_id, event, window, cx),
                         WorldAction::Stop => view.stop_world(world_id, event, window, cx),
@@ -1880,18 +2024,26 @@ impl MineDockView {
                     .rounded(px(12.))
                     .bg(rgb(0x1A1E25))
                     .text_color(rgb(0x9CA3AF))
-                    .child("No worlds yet. Create one from a built-in template to get started."),
+                    .child(self.language.text(UiText::NoWorlds)),
             );
         }
-        cards
+        div()
+            .id("world-library")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.world_scroll)
+            .child(cards)
     }
 
     fn render_wizard(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         let mut templates = div().flex().gap(px(8.));
         if let Some(catalog) = &self.catalog {
             for template in catalog.iter() {
                 let id = template.id.clone();
                 let selected = self.selected_template.as_ref() == Some(&id);
+                let template_name = language.template_name(template.id.as_str(), &template.name);
                 templates = templates.child(
                     div()
                         .id(SharedString::from(format!("template-{id}")))
@@ -1905,7 +2057,7 @@ impl MineDockView {
                             rgb(0x292E38)
                         })
                         .text_color(rgb(0xF2F4F8))
-                        .child(template.name.clone())
+                        .child(template_name)
                         .on_click(cx.listener(move |this, event, window, cx| {
                             this.select_template(id.clone(), event, window, cx)
                         })),
@@ -1917,12 +2069,14 @@ impl MineDockView {
             .as_ref()
             .and_then(|id| self.catalog.as_ref()?.get(id))
             .map(|template| {
-                format!(
-                    "Safe defaults: online-mode=true  ·  whitelist={}  ·  {} players  ·  {}",
-                    template.server.whitelist, template.server.max_players, template.name
+                let template_name = language.template_name(template.id.as_str(), &template.name);
+                language.safe_defaults(
+                    template.server.whitelist,
+                    template.server.max_players,
+                    &template_name,
                 )
             })
-            .unwrap_or_else(|| "Select a template to see its safe defaults.".into());
+            .unwrap_or_else(|| language.text(UiText::SelectTemplate).into());
         let create_enabled = self.can_create(cx);
         div()
             .absolute()
@@ -1943,8 +2097,12 @@ impl MineDockView {
                     .flex()
                     .flex_col()
                     .gap(px(14.))
-                    .child(div().text_size(px(22.)).child("Create a World"))
-                    .child(label("Name"))
+                    .child(
+                        div()
+                            .text_size(px(22.))
+                            .child(language.text(UiText::CreateWorld)),
+                    )
+                    .child(label(language.text(UiText::Name)))
                     .child(
                         div()
                             .w_full()
@@ -1954,13 +2112,13 @@ impl MineDockView {
                             .border_color(rgb(0x424B5B))
                             .child(self.name_input.clone()),
                     )
-                    .child(label("Template"))
+                    .child(label(language.text(UiText::Template)))
                     .child(templates)
-                    .child(label("Minecraft"))
+                    .child(label(language.text(UiText::Minecraft)))
                     .child(
                         div()
                             .text_color(rgb(0xB9C0CC))
-                            .child("Vanilla · current release"),
+                            .child(language.text(UiText::VanillaCurrentRelease)),
                     )
                     .child(div().text_color(rgb(0x91A0B7)).child(summary))
                     .when_some(self.wizard_error.clone(), |element, error| {
@@ -1972,13 +2130,13 @@ impl MineDockView {
                             .justify_end()
                             .gap(px(10.))
                             .child(button(
-                                "Cancel",
+                                language.text(UiText::Cancel),
                                 rgb(0x303744),
                                 true,
                                 cx.listener(Self::cancel_wizard),
                             ))
                             .child(button(
-                                "Create",
+                                language.text(UiText::Create),
                                 rgb(0x3D5A88),
                                 create_enabled,
                                 cx.listener(Self::create_world),
@@ -1988,6 +2146,7 @@ impl MineDockView {
     }
 
     fn render_eula_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         div()
             .absolute()
             .inset_0()
@@ -2006,19 +2165,22 @@ impl MineDockView {
                     .flex()
                     .flex_col()
                     .gap(px(14.))
-                    .child(div().text_size(px(22.)).child("Minecraft EULA"))
+                    .child(
+                        div()
+                            .text_size(px(22.))
+                            .child(language.text(UiText::EulaTitle)),
+                    )
                     .child(
                         div()
                             .text_color(rgb(0xD3D8E2))
-                            .child("Minecraft server software is subject to the official Minecraft EULA. MineDock needs your explicit agreement before it can download or provision server software."),
+                            .child(language.text(UiText::EulaBody)),
                     )
-                    .child(
-                        div()
-                            .text_color(rgb(0x91A0B7))
-                            .child(format!("Official EULA: {OFFICIAL_EULA_URL}")),
-                    )
+                    .child(div().text_color(rgb(0x91A0B7)).child(format!(
+                        "{}: {OFFICIAL_EULA_URL}",
+                        language.text(UiText::OfficialEula)
+                    )))
                     .child(button(
-                        "View official EULA",
+                        language.text(UiText::ViewOfficialEula),
                         rgb(0x34415C),
                         true,
                         cx.listener(Self::open_eula_link),
@@ -2032,13 +2194,13 @@ impl MineDockView {
                             .justify_end()
                             .gap(px(10.))
                             .child(button(
-                                "Cancel",
+                                language.text(UiText::Cancel),
                                 rgb(0x303744),
                                 true,
                                 cx.listener(Self::cancel_eula),
                             ))
                             .child(button(
-                                "I Agree",
+                                language.text(UiText::Agree),
                                 rgb(0x3D5A88),
                                 true,
                                 cx.listener(Self::accept_eula),
@@ -2059,7 +2221,11 @@ impl Render for MineDockView {
             .flex_col()
             .gap(px(20.))
             .child(self.render_header(cx))
-            .child(div().text_size(px(20.)).child("Worlds"))
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .child(self.language.text(UiText::Worlds)),
+            )
             .child(self.render_library(cx));
         if let Some(error) = &self.startup_error {
             content = content.child(
@@ -2068,9 +2234,17 @@ impl Render for MineDockView {
                     .rounded(px(8.))
                     .bg(rgb(0x42262B))
                     .text_color(rgb(0xFFB4B4))
-                    .child(format!(
-                        "Startup error — {error}. Mutating actions are disabled."
-                    )),
+                    .child(self.language.startup_error(error)),
+            );
+        }
+        if let Some(error) = &self.settings_error {
+            content = content.child(
+                div()
+                    .p(px(12.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x42262B))
+                    .text_color(rgb(0xFFB4B4))
+                    .child(self.language.settings_error(error)),
             );
         }
         if let Some(error) = &self.lifecycle_error {
@@ -2135,6 +2309,7 @@ fn connection_endpoint_row(
     world_id: WorldId,
     endpoint: &str,
     interface_name: &str,
+    language: Language,
     handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -2151,7 +2326,7 @@ fn connection_endpoint_row(
                 .child(
                     div()
                         .text_color(rgb(0x707987))
-                        .child(format!("via {interface_name}")),
+                        .child(language.via(interface_name)),
                 ),
         )
         .child(
@@ -2164,7 +2339,7 @@ fn connection_endpoint_row(
                 .rounded(px(7.))
                 .bg(rgb(0x34415C))
                 .text_color(rgb(0xE7EEFF))
-                .child("COPY")
+                .child(language.text(UiText::Copy))
                 .focusable()
                 .on_click(handler),
         )
@@ -2176,6 +2351,7 @@ fn world_card(
     action: WorldAction,
     action_enabled: bool,
     connection: impl IntoElement,
+    language: Language,
     action_handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let (indicator, status_color) = match status {
@@ -2184,19 +2360,19 @@ fn world_card(
         WorldStatus::Failed => ("!", rgb(0xFF9B9B)),
         _ => ("◌", rgb(0xF0C674)),
     };
-    let status_text = format!("{indicator}  {status:?}");
+    let status_text = format!("{indicator}  {}", language.status(status));
     let action_text = match action {
-        WorldAction::Start => "START",
-        WorldAction::Stop => "STOP",
-        WorldAction::ForceStop => "FORCE STOP",
+        WorldAction::Start => language.action(UiAction::Start),
+        WorldAction::Stop => language.action(UiAction::Stop),
+        WorldAction::ForceStop => language.action(UiAction::ForceStop),
         WorldAction::None => match status {
-            WorldStatus::Stopped => "START",
-            WorldStatus::Preparing => "PREPARING",
-            WorldStatus::Starting => "STARTING",
-            WorldStatus::Running => "STOP",
-            WorldStatus::Stopping => "STOPPING",
-            WorldStatus::BackingUp => "BACKING UP",
-            WorldStatus::Failed => "RECOVER REQUIRED",
+            WorldStatus::Stopped => language.action(UiAction::Start),
+            WorldStatus::Preparing => language.text(UiText::Preparing),
+            WorldStatus::Starting => language.text(UiText::Starting),
+            WorldStatus::Running => language.action(UiAction::Stop),
+            WorldStatus::Stopping => language.text(UiText::Stopping),
+            WorldStatus::BackingUp => language.text(UiText::BackingUp),
+            WorldStatus::Failed => language.text(UiText::RecoverRequired),
         },
     };
     let action_color = match action {
@@ -2241,14 +2417,14 @@ fn world_card(
                 .child(
                     div()
                         .text_color(rgb(0x9CA3AF))
-                        .child(format!("Vanilla · {}", world.server.version)),
+                        .child(language.vanilla_version(&world.server.version)),
                 )
                 .child(div().text_color(status_color).child(status_text))
                 .child(connection)
                 .child(
                     div()
                         .text_color(rgb(0x707987))
-                        .child("Vanilla release, Java, and server files are prepared on Start"),
+                        .child(language.text(UiText::WorldDescription)),
                 ),
         )
         .child(action)

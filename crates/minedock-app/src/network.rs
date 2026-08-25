@@ -34,15 +34,23 @@ impl LanIpv4Candidate {
 pub enum LanAddressState {
     #[default]
     Checking,
-    Unavailable(String),
+    Unavailable(LanAddressUnavailableReason),
     Available(LanIpv4Candidate),
     Ambiguous(Vec<LanIpv4Candidate>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanAddressUnavailableReason {
+    NoUsablePrivateIpv4,
+    AdapterEnumerationFailed(String),
 }
 
 pub fn discover_lan_address_state() -> LanAddressState {
     match discover_system_candidates() {
         Ok(candidates) => select_lan_address(candidates),
-        Err(error) => LanAddressState::Unavailable(error),
+        Err(error) => LanAddressState::Unavailable(
+            LanAddressUnavailableReason::AdapterEnumerationFailed(error),
+        ),
     }
 }
 
@@ -62,9 +70,7 @@ pub fn select_lan_address(
     candidates.dedup();
 
     match candidates.len() {
-        0 => LanAddressState::Unavailable(
-            "No usable private LAN IPv4 address was found. Check that a Wi-Fi or Ethernet adapter is connected.".into(),
-        ),
+        0 => LanAddressState::Unavailable(LanAddressUnavailableReason::NoUsablePrivateIpv4),
         1 => LanAddressState::Available(candidates.remove(0)),
         _ => LanAddressState::Ambiguous(candidates),
     }
