@@ -46,6 +46,8 @@ type LifecyclePollResult = (WorldId, minedock_core::Result<Option<ProcessExit>>)
 type LifecyclePollResults = Vec<LifecyclePollResult>;
 type LifecycleEventResult = (WorldId, minedock_core::Result<Vec<ServerEvent>>);
 type LifecycleEventResults = Vec<LifecycleEventResult>;
+type LifecycleStopEventResult = minedock_core::Result<(Option<StopOutcome>, Vec<ServerEvent>)>;
+type LifecycleStopEventBatch<P, F, L> = (LifecycleSupervisor<P, F, L>, LifecycleStopEventResult);
 
 struct PreparedLaunch {
     launch_spec: LaunchSpec,
@@ -82,6 +84,37 @@ struct RecentLogLine {
     stream: LogStream,
     line: String,
     truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JavaPathInputError {
+    ControlCharacter,
+    NotAbsolute,
+}
+
+fn parse_java_path_input(value: &str) -> Result<Option<PathBuf>, JavaPathInputError> {
+    if value
+        .chars()
+        .any(|character| character == '\0' || character == '\r' || character == '\n')
+    {
+        return Err(JavaPathInputError::ControlCharacter);
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(JavaPathInputError::NotAbsolute);
+    }
+    Ok(Some(path))
+}
+
+fn clear_recent_logs_for_new_session(
+    recent_logs: &mut HashMap<WorldId, VecDeque<RecentLogLine>>,
+    world_id: WorldId,
+) {
+    recent_logs.remove(&world_id);
 }
 
 fn prepare_launch(
@@ -212,6 +245,7 @@ where
     (lifecycle, result)
 }
 
+#[allow(dead_code)]
 fn execute_lifecycle_stop<P, F, L>(
     mut lifecycle: LifecycleSupervisor<P, F, L>,
     world_id: WorldId,
@@ -225,6 +259,19 @@ where
     L: minedock_core::LifecycleLeaseProvider,
 {
     let result = lifecycle.stop(world_id, STOP_TIMEOUT);
+    (lifecycle, result)
+}
+
+fn execute_lifecycle_stop_with_events<P, F, L>(
+    mut lifecycle: LifecycleSupervisor<P, F, L>,
+    world_id: WorldId,
+) -> LifecycleStopEventBatch<P, F, L>
+where
+    P: minedock_core::LifecyclePersistence,
+    F: minedock_core::ProcessFactory,
+    L: minedock_core::LifecycleLeaseProvider,
+{
+    let result = lifecycle.stop_with_events(world_id, STOP_TIMEOUT, 64);
     (lifecycle, result)
 }
 
@@ -1216,18 +1263,24 @@ impl MineDockView {
 
     fn save_java_path(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         let raw_path = self.java_path_input.read(cx).content.to_string();
-        if raw_path
-            .chars()
-            .any(|character| character == '\0' || character == '\r' || character == '\n')
-        {
-            self.java_settings_error = Some(
-                "The Java path must not contain control characters. Paste a java.exe path and retry."
-                    .into(),
-            );
-            cx.notify();
-            return;
-        }
-        let configured_path = (!raw_path.trim().is_empty()).then(|| PathBuf::from(raw_path.trim()));
+        let configured_path = match parse_java_path_input(&raw_path) {
+            Ok(path) => path,
+            Err(JavaPathInputError::ControlCharacter) => {
+                self.java_settings_error = Some(
+                    self.language
+                        .text(UiText::JavaPathControlCharacterError)
+                        .into(),
+                );
+                cx.notify();
+                return;
+            }
+            Err(JavaPathInputError::NotAbsolute) => {
+                self.java_settings_error =
+                    Some(self.language.text(UiText::JavaPathAbsoluteError).into());
+                cx.notify();
+                return;
+            }
+        };
         let Some(library) = self.library.as_ref() else {
             self.java_settings_error = Some("MineDock's world library is unavailable.".into());
             cx.notify();
@@ -1585,6 +1638,7 @@ impl MineDockView {
         };
 
         self.active_operation = Some(LifecycleOperation::Starting(world_id));
+        clear_recent_logs_for_new_session(&mut self.recent_logs, world_id);
         self.status_overrides
             .insert(world_id, WorldStatus::Preparing);
         self.lifecycle_error = None;
@@ -1699,41 +1753,47 @@ impl MineDockView {
 
         let worker = cx
             .background_executor()
-            .spawn(async move { execute_lifecycle_stop(lifecycle, world_id) });
+            .spawn(async move { execute_lifecycle_stop_with_events(lifecycle, world_id) });
         cx.spawn(async move |this, cx| {
             let (lifecycle, result) = worker.await;
             let _ = this.update(cx, |view, cx| {
                 view._lifecycle = Some(lifecycle);
                 match result {
-                    Ok(Some(StopOutcome::Exited { exit })) => {
-                        view.active_operation = None;
-                        view.pending_force_stop = None;
-                        view.status_overrides.remove(&world_id);
-                        view.lifecycle_error = if exit.success {
-                            None
-                        } else {
-                            Some(format!(
-                                "World stop completed with a failure (exit code {:?}); it was marked Failed.",
-                                exit.code
-                            ))
-                        };
-                    }
-                    Ok(Some(StopOutcome::TimedOut(token))) => {
-                        view.active_operation = Some(LifecycleOperation::Stopping(world_id));
-                        view.pending_force_stop = Some((world_id, token));
-                        view.status_overrides
-                            .insert(world_id, WorldStatus::Stopping);
-                        view.lifecycle_error = Some(
-                            "Graceful stop timed out; the server is still running. Use Force Stop only if you accept possible data loss.".into(),
-                        );
-                    }
-                    Ok(None) => {
-                        view.active_operation = None;
-                        view.pending_force_stop = None;
-                        view.status_overrides.remove(&world_id);
-                        view.lifecycle_error = Some(
-                            "MineDock could not stop this world because no active lifecycle session was found.".into(),
-                        );
+                    Ok((outcome, events)) => {
+                        view.record_server_events(world_id, events);
+                        match outcome {
+                            Some(StopOutcome::Exited { exit }) => {
+                                view.active_operation = None;
+                                view.pending_force_stop = None;
+                                view.status_overrides.remove(&world_id);
+                                view.lifecycle_error = if exit.success {
+                                    None
+                                } else {
+                                    Some(format!(
+                                        "World stop completed with a failure (exit code {:?}); it was marked Failed.",
+                                        exit.code
+                                    ))
+                                };
+                            }
+                            Some(StopOutcome::TimedOut(token)) => {
+                                view.active_operation =
+                                    Some(LifecycleOperation::Stopping(world_id));
+                                view.pending_force_stop = Some((world_id, token));
+                                view.status_overrides
+                                    .insert(world_id, WorldStatus::Stopping);
+                                view.lifecycle_error = Some(
+                                    "Graceful stop timed out; the server is still running. Use Force Stop only if you accept possible data loss.".into(),
+                                );
+                            }
+                            None => {
+                                view.active_operation = None;
+                                view.pending_force_stop = None;
+                                view.status_overrides.remove(&world_id);
+                                view.lifecycle_error = Some(
+                                    "MineDock could not stop this world because no active lifecycle session was found.".into(),
+                                );
+                            }
+                        }
                     }
                     Err(error) => {
                         view.active_operation = None;
@@ -3026,10 +3086,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        EULA_ACCEPTANCE_FILE, LifecycleOperation, eula_acceptance_path, eula_requires_confirmation,
+        EULA_ACCEPTANCE_FILE, JavaPathInputError, LifecycleOperation, RecentLogLine,
+        clear_recent_logs_for_new_session, eula_acceptance_path, eula_requires_confirmation,
         execute_lifecycle_force_stop, execute_lifecycle_poll, execute_lifecycle_start,
-        execute_lifecycle_stop, poll_exit_allowed, select_java_runtime, start_allowed,
-        stop_allowed, utf16_range_to_byte_range,
+        execute_lifecycle_stop, parse_java_path_input, poll_exit_allowed, select_java_runtime,
+        start_allowed, stop_allowed, utf16_range_to_byte_range,
     };
     use minedock_core::{
         EulaAcceptanceRepository, FileEulaAcceptanceRepository, GracefulStopResult,
@@ -3038,6 +3099,7 @@ mod tests {
         ServerEvent, ServerProcess, SessionId, StopEscalationToken, ValidatedServerCommand,
         WorldId, WorldStatus,
     };
+    use std::collections::{HashMap, VecDeque};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -3235,6 +3297,42 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("No Java executable candidates were found"));
         assert!(message.contains("Choose a compatible Java executable"));
+    }
+
+    #[test]
+    fn configured_java_path_requires_a_stable_absolute_path() {
+        assert_eq!(parse_java_path_input("  \t"), Ok(None));
+        assert_eq!(
+            parse_java_path_input("java.exe"),
+            Err(JavaPathInputError::NotAbsolute)
+        );
+        assert_eq!(
+            parse_java_path_input("C:\\Java\\bin\\java.exe"),
+            if cfg!(windows) {
+                Ok(Some(PathBuf::from(r"C:\Java\bin\java.exe")))
+            } else {
+                Err(JavaPathInputError::NotAbsolute)
+            }
+        );
+        assert_eq!(
+            parse_java_path_input("C:\\Java\n\\bin\\java.exe"),
+            Err(JavaPathInputError::ControlCharacter)
+        );
+    }
+
+    #[test]
+    fn new_session_discards_previous_recent_logs() {
+        let world_id = WorldId::new();
+        let mut recent_logs = HashMap::from([(
+            world_id,
+            VecDeque::from([RecentLogLine {
+                stream: minedock_core::LogStream::Stdout,
+                line: "old session".into(),
+                truncated: false,
+            }]),
+        )]);
+        clear_recent_logs_for_new_session(&mut recent_logs, world_id);
+        assert!(!recent_logs.contains_key(&world_id));
     }
 
     #[test]

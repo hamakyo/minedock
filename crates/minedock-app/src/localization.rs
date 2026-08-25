@@ -63,6 +63,8 @@ pub enum UiText {
     JavaPath,
     JavaPathPlaceholder,
     JavaSettingsHint,
+    JavaPathControlCharacterError,
+    JavaPathAbsoluteError,
     SaveAndRetry,
     Close,
     Details,
@@ -266,6 +268,18 @@ impl Language {
             }
             (Self::Japanese, UiText::JavaSettingsHint) => {
                 "互換性のあるjava.exeのパスを貼り付けて、保存して再試行してください。"
+            }
+            (Self::English, UiText::JavaPathControlCharacterError) => {
+                "The Java path must not contain control characters."
+            }
+            (Self::Japanese, UiText::JavaPathControlCharacterError) => {
+                "Javaパスに制御文字は使用できません。"
+            }
+            (Self::English, UiText::JavaPathAbsoluteError) => {
+                "Enter an absolute path to java.exe, for example C:\\Program Files\\Java\\bin\\java.exe."
+            }
+            (Self::Japanese, UiText::JavaPathAbsoluteError) => {
+                "java.exeの絶対パスを入力してください。例: C:\\Program Files\\Java\\bin\\java.exe"
             }
             (Self::English, UiText::SaveAndRetry) => "Save & Retry",
             (Self::Japanese, UiText::SaveAndRetry) => "保存して再試行",

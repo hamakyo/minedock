@@ -695,8 +695,31 @@ where
     /// Returns `Ok(None)` when no active session exists, making repeated stop
     /// requests for a persisted Stopped world idempotent.
     pub fn stop(&mut self, world_id: WorldId, timeout: Duration) -> Result<Option<StopOutcome>> {
+        self.stop_inner(world_id, timeout, None)
+            .map(|(outcome, _events)| outcome)
+    }
+
+    /// Stop a world and collect the final bounded process events before a
+    /// normally exited session is removed from the supervisor. This keeps the
+    /// UI's current-session log projection from losing output emitted during
+    /// graceful shutdown.
+    pub fn stop_with_events(
+        &mut self,
+        world_id: WorldId,
+        timeout: Duration,
+        max_raw: usize,
+    ) -> Result<(Option<StopOutcome>, Vec<ServerEvent>)> {
+        self.stop_inner(world_id, timeout, Some(max_raw))
+    }
+
+    fn stop_inner(
+        &mut self,
+        world_id: WorldId,
+        timeout: Duration,
+        max_raw: Option<usize>,
+    ) -> Result<(Option<StopOutcome>, Vec<ServerEvent>)> {
         let Some(session) = self.sessions.get(&world_id) else {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         };
         if session.status != WorldStatus::Running {
             return Err(MineDockError::InvalidState(format!(
@@ -735,7 +758,12 @@ where
                 if let Some(session) = self.sessions.get_mut(&world_id) {
                     session.stop_token = Some(token);
                 }
-                Ok(Some(StopOutcome::TimedOut(token)))
+                let events = max_raw.map_or_else(Vec::new, |limit| {
+                    self.sessions
+                        .get(&world_id)
+                        .map_or_else(Vec::new, |session| session.process.drain_events(limit))
+                });
+                Ok((Some(StopOutcome::TimedOut(token)), events))
             }
             GracefulStopResult::Exited { exit } => {
                 let target = if exit.success {
@@ -743,11 +771,16 @@ where
                 } else {
                     WorldStatus::Failed
                 };
+                let events = max_raw.map_or_else(Vec::new, |limit| {
+                    self.sessions
+                        .get(&world_id)
+                        .map_or_else(Vec::new, |session| session.process.drain_events(limit))
+                });
                 self.persistence
                     .persist_session(world_id, target, None, None)?;
                 self.persistence.clear_process_id(world_id)?;
                 self.sessions.remove(&world_id);
-                Ok(Some(StopOutcome::Exited { exit }))
+                Ok((Some(StopOutcome::Exited { exit }), events))
             }
         }
     }
@@ -979,6 +1012,81 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct FinalEventFactory;
+
+    #[derive(Debug)]
+    struct FinalEventProcess {
+        world_id: WorldId,
+        session_id: SessionId,
+    }
+
+    impl ServerProcess for FinalEventProcess {
+        fn world_id(&self) -> WorldId {
+            self.world_id
+        }
+
+        fn session_id(&self) -> SessionId {
+            self.session_id
+        }
+
+        fn pid(&self) -> u32 {
+            4321
+        }
+
+        fn send_command(&mut self, _: &ValidatedServerCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn graceful_stop(&mut self, _: Duration) -> Result<GracefulStopResult> {
+            Ok(GracefulStopResult::Exited {
+                exit: ProcessExit {
+                    code: Some(0),
+                    success: true,
+                },
+            })
+        }
+
+        fn force_terminate(&mut self, _: StopEscalationToken) -> Result<ProcessExit> {
+            Ok(ProcessExit {
+                code: Some(1),
+                success: false,
+            })
+        }
+
+        fn force_cleanup_after_start_failure(&mut self) -> Result<ProcessExit> {
+            Ok(ProcessExit {
+                code: Some(1),
+                success: false,
+            })
+        }
+
+        fn try_wait(&mut self) -> Result<Option<ProcessExit>> {
+            Ok(None)
+        }
+
+        fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
+            vec![ServerEvent::Raw(RawLogLine {
+                world_id: self.world_id,
+                session_id: self.session_id,
+                stream: LogStream::Stdout,
+                line: "server stopped cleanly".into(),
+                truncated: false,
+            })]
+        }
+    }
+
+    impl ProcessFactory for FinalEventFactory {
+        type Process = FinalEventProcess;
+
+        fn spawn(&mut self, spec: &LaunchSpec, session_id: SessionId) -> Result<Self::Process> {
+            Ok(FinalEventProcess {
+                world_id: spec.world_id,
+                session_id,
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct FailOnRunningPersistence {
         inner: InMemoryLifecyclePersistence,
     }
@@ -1033,6 +1141,38 @@ mod tests {
         assert!(ValidatedServerCommand::parse("stop\n").is_err());
         assert!(ValidatedServerCommand::parse("say hi\0").is_err());
         assert_eq!(ValidatedServerCommand::stop().wire_bytes(), b"stop\n");
+    }
+
+    #[test]
+    fn stop_with_events_collects_final_output_before_session_removal() {
+        let world_id = WorldId::new();
+        let mut supervisor = LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            FinalEventFactory,
+            TestLeaseProvider,
+        );
+        supervisor
+            .start(Path::new("."), world_id, || Ok(test_spec(world_id)))
+            .expect("start");
+
+        let (outcome, events) = supervisor
+            .stop_with_events(world_id, Duration::from_millis(1), 64)
+            .expect("stop with events");
+        assert!(matches!(
+            outcome,
+            Some(StopOutcome::Exited { exit }) if exit.success
+        ));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::Raw(RawLogLine { line, .. }) if line == "server stopped cleanly"
+            )
+        }));
+        assert_eq!(supervisor.session_id(world_id), None);
+        assert_eq!(
+            supervisor.persistence().status(world_id),
+            Some(WorldStatus::Stopped)
+        );
     }
 
     #[test]
