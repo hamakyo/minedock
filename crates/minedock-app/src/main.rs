@@ -34,7 +34,7 @@ mod native_process;
 mod native_safety;
 mod network;
 
-use localization::{Language, UiAction, UiText};
+use localization::{JavaStatus, Language, UiAction, UiText};
 use network::LanAddressState;
 
 type AppLifecycle = LifecycleSupervisor<
@@ -47,7 +47,7 @@ type LifecyclePollResults = Vec<LifecyclePollResult>;
 
 struct PreparedLaunch {
     launch_spec: LaunchSpec,
-    java_status: String,
+    java_status: JavaStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,11 +96,14 @@ fn prepare_launch(
     })
 }
 
-fn select_java_runtime(readiness: JavaReadiness) -> minedock_core::Result<(JavaRuntime, String)> {
-    let java_status = readiness.status_text();
-    let runtime = readiness.runtime.ok_or_else(|| {
+fn select_java_runtime(
+    readiness: JavaReadiness,
+) -> minedock_core::Result<(JavaRuntime, JavaStatus)> {
+    let java_status = JavaStatus::from_readiness(&readiness);
+    let runtime = readiness.runtime.clone().ok_or_else(|| {
+        let status_text = readiness.status_text();
         MineDockError::JavaUnavailable(format!(
-            "{java_status}. Choose a compatible Java executable and retry."
+            "{status_text}. Choose a compatible Java executable and retry."
         ))
     })?;
     Ok((runtime, java_status))
@@ -120,7 +123,7 @@ fn execute_start(
     progress: Sender<StartProgress>,
 ) -> (
     AppLifecycle,
-    Option<String>,
+    Option<JavaStatus>,
     minedock_core::Result<SessionId>,
 ) {
     let mut java_status = None;
@@ -890,7 +893,7 @@ struct MineDockView {
     wizard_open: bool,
     selected_template: Option<TemplateId>,
     wizard_error: Option<String>,
-    java_status: String,
+    java_status: JavaStatus,
     eula_open: bool,
     pending_start: Option<WorldId>,
     eula_error: Option<String>,
@@ -921,7 +924,7 @@ impl MineDockView {
                     wizard_open: false,
                     selected_template: None,
                     wizard_error: None,
-                    java_status: "Java readiness unavailable".into(),
+                    java_status: JavaStatus::Unavailable { reason: None },
                     eula_open: false,
                     pending_start: None,
                     eula_error: None,
@@ -945,13 +948,13 @@ impl MineDockView {
         let library = match resolve_app_data_root() {
             Ok(root) => {
                 let repository = JsonWorldRepository::new(root);
-                match localization::load_language(repository.root()) {
-                    Ok(value) => language = value,
-                    Err(error) => settings_error = Some(error),
-                }
                 match lifecycle_adapter::AppDataLease::acquire(repository.root()) {
                     Ok(lease) => {
                         app_data_lease = Some(lease);
+                        match localization::load_language(repository.root()) {
+                            Ok(value) => language = value,
+                            Err(error) => settings_error = Some(error),
+                        }
                         if let Err(error) =
                             lifecycle_adapter::JsonLifecyclePersistence::recover_startup(
                                 &repository,
@@ -1007,15 +1010,7 @@ impl MineDockView {
                 .await;
             if let Some(readiness) = readiness {
                 let _ = this.update(cx, |view, cx| {
-                    view.java_status = readiness.runtime.as_ref().map_or_else(
-                        || readiness.status_text(),
-                        |runtime| {
-                            format!(
-                                "Java detected (major {}; release check pending)",
-                                runtime.version.major
-                            )
-                        },
-                    );
+                    view.java_status = JavaStatus::detected_from_readiness(&readiness);
                     cx.notify();
                 });
             }
@@ -1061,7 +1056,7 @@ impl MineDockView {
             wizard_open: false,
             selected_template,
             wizard_error: None,
-            java_status: "Checking Java readiness…".into(),
+            java_status: JavaStatus::Checking,
             eula_open: false,
             pending_start: None,
             eula_error: None,
@@ -1632,6 +1627,9 @@ impl MineDockView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_change_language() {
+            return;
+        }
         if self.language == language && self.settings_error.is_none() {
             return;
         }
@@ -1641,13 +1639,19 @@ impl MineDockView {
                 input.placeholder = language.text(UiText::NamePlaceholder).into();
             });
         }
-        if let Some(library) = self.library.as_ref() {
+        if let (Some(library), Some(_lease)) =
+            (self.library.as_ref(), self._app_data_lease.as_ref())
+        {
             match localization::save_language(library.repository().root(), language) {
                 Ok(()) => self.settings_error = None,
                 Err(error) => self.settings_error = Some(error),
             }
         }
         cx.notify();
+    }
+
+    fn can_change_language(&self) -> bool {
+        self.library.is_some() && self._app_data_lease.is_some()
     }
 
     fn render_connection(
@@ -1684,7 +1688,7 @@ impl MineDockView {
             LanAddressState::Unavailable(reason) => section.child(
                 div()
                     .text_color(rgb(0xFFB4B4))
-                    .child(self.language.endpoint_unavailable(&reason)),
+                    .child(self.language.lan_unavailable(&reason)),
             ),
             LanAddressState::Available(candidate) => {
                 let endpoint = candidate
@@ -1847,6 +1851,7 @@ impl MineDockView {
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
         let can_mutate = self.can_mutate();
+        let can_change_language = self.can_change_language();
         div()
             .flex()
             .justify_between()
@@ -1886,15 +1891,29 @@ impl MineDockView {
                                     .rounded(px(6.))
                                     .bg(if language == Language::English {
                                         rgb(0x3D5A88)
-                                    } else {
+                                    } else if can_change_language {
                                         rgb(0x292E38)
+                                    } else {
+                                        rgb(0x252932)
                                     })
-                                    .text_color(rgb(0xE7EEFF))
+                                    .text_color(if can_change_language {
+                                        rgb(0xE7EEFF)
+                                    } else {
+                                        rgb(0x737985)
+                                    })
                                     .child(language.text(UiText::English))
-                                    .focusable()
-                                    .on_click(cx.listener(|view, event, window, cx| {
-                                        view.set_language(Language::English, event, window, cx)
-                                    })),
+                                    .when(can_change_language, |element| {
+                                        element.focusable().on_click(cx.listener(
+                                            |view, event, window, cx| {
+                                                view.set_language(
+                                                    Language::English,
+                                                    event,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
                             )
                             .child(
                                 div()
@@ -1904,15 +1923,29 @@ impl MineDockView {
                                     .rounded(px(6.))
                                     .bg(if language == Language::Japanese {
                                         rgb(0x3D5A88)
-                                    } else {
+                                    } else if can_change_language {
                                         rgb(0x292E38)
+                                    } else {
+                                        rgb(0x252932)
                                     })
-                                    .text_color(rgb(0xE7EEFF))
+                                    .text_color(if can_change_language {
+                                        rgb(0xE7EEFF)
+                                    } else {
+                                        rgb(0x737985)
+                                    })
                                     .child(language.text(UiText::Japanese))
-                                    .focusable()
-                                    .on_click(cx.listener(|view, event, window, cx| {
-                                        view.set_language(Language::Japanese, event, window, cx)
-                                    })),
+                                    .when(can_change_language, |element| {
+                                        element.focusable().on_click(cx.listener(
+                                            |view, event, window, cx| {
+                                                view.set_language(
+                                                    Language::Japanese,
+                                                    event,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
                             ),
                     )
                     .child(

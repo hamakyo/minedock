@@ -1,5 +1,6 @@
+use crate::network::LanAddressUnavailableReason;
 use atomic_write_file::AtomicWriteFile;
-use minedock_core::WorldStatus;
+use minedock_core::{JavaReadiness, JavaUnavailableReason, WorldStatus};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -65,6 +66,46 @@ pub enum UiAction {
     Start,
     Stop,
     ForceStop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JavaStatus {
+    Checking,
+    Detected {
+        major: u16,
+    },
+    Ready {
+        major: u16,
+        executable: String,
+    },
+    Unavailable {
+        reason: Option<JavaUnavailableReason>,
+    },
+}
+
+impl JavaStatus {
+    pub fn from_readiness(readiness: &JavaReadiness) -> Self {
+        if let Some(runtime) = &readiness.runtime {
+            return Self::Ready {
+                major: runtime.version.major.get(),
+                executable: runtime.executable.display().to_string(),
+            };
+        }
+        Self::Unavailable {
+            reason: readiness.reasons.first().cloned(),
+        }
+    }
+
+    pub fn detected_from_readiness(readiness: &JavaReadiness) -> Self {
+        if let Some(runtime) = &readiness.runtime {
+            return Self::Detected {
+                major: runtime.version.major.get(),
+            };
+        }
+        Self::Unavailable {
+            reason: readiness.reasons.first().cloned(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -216,35 +257,92 @@ impl Language {
         fallback.to_owned()
     }
 
-    pub fn java_status(self, status: &str) -> String {
-        if self == Self::Japanese {
-            if let Some(major) = status
-                .strip_prefix("Java detected (major ")
-                .and_then(|value| value.strip_suffix("; release check pending)"))
-            {
-                return format!("Java {major}を検出（リリース確認待ち）");
+    pub fn java_status(self, status: &JavaStatus) -> String {
+        match (self, status) {
+            (Self::English, JavaStatus::Checking) => "Checking Java readiness…".into(),
+            (Self::Japanese, JavaStatus::Checking) => "Javaの状態を確認中…".into(),
+            (Self::English, JavaStatus::Detected { major }) => {
+                format!("Java detected (major {major}; release check pending)")
             }
-            if status == "Checking Java readiness…" {
-                return "Javaの状態を確認中…".into();
+            (Self::Japanese, JavaStatus::Detected { major }) => {
+                format!("Java {major}を検出（リリース確認待ち）")
             }
-            if status == "Java runtime unavailable" {
-                return "Javaランタイムを利用できません".into();
+            (Self::English, JavaStatus::Ready { major, executable }) => {
+                format!("Java {major} ready ({executable})")
             }
-            if let Some(details) = status.strip_prefix("Java ") {
-                if let Some((major, executable)) = details.split_once(" ready (") {
-                    let executable = executable.strip_suffix(')').unwrap_or(executable);
-                    return format!("Java {major}が利用可能（{executable}）");
-                }
+            (Self::Japanese, JavaStatus::Ready { major, executable }) => {
+                format!("Java {major}が利用可能（{executable}）")
             }
+            (Self::English, JavaStatus::Unavailable { reason }) => reason.as_ref().map_or_else(
+                || "Java runtime unavailable".into(),
+                |reason| reason.safe_diagnostics(),
+            ),
+            (Self::Japanese, JavaStatus::Unavailable { reason }) => reason.as_ref().map_or_else(
+                || "Javaランタイムを利用できません".into(),
+                |reason| self.japanese_java_unavailable(reason),
+            ),
         }
-        status.to_owned()
     }
 
-    pub fn endpoint_unavailable(self, reason: &str) -> String {
-        if self == Self::Japanese {
-            format!("接続先を表示できません: {reason}")
-        } else {
-            format!("Connection endpoint unavailable: {reason}")
+    fn japanese_java_unavailable(self, reason: &JavaUnavailableReason) -> String {
+        debug_assert_eq!(self, Self::Japanese);
+        match reason {
+            JavaUnavailableReason::NoCandidates => "Java実行ファイルが見つかりません。".into(),
+            JavaUnavailableReason::CandidateMissing { path } => {
+                format!("Java候補が存在しません: {}", path.display())
+            }
+            JavaUnavailableReason::CandidateNotRegularFile { path } => {
+                format!("Java候補は通常のファイルではありません: {}", path.display())
+            }
+            JavaUnavailableReason::ProbeFailed { path, detail } => {
+                format!("Javaを実行できませんでした: {} — {detail}", path.display())
+            }
+            JavaUnavailableReason::TimedOut { path } => {
+                format!(
+                    "Javaのバージョン確認がタイムアウトしました: {}",
+                    path.display()
+                )
+            }
+            JavaUnavailableReason::NonZeroExit {
+                path,
+                code,
+                diagnostics,
+            } => format!(
+                "{} は終了コード {:?}で終了しました: {diagnostics}",
+                path.display(),
+                code
+            ),
+            JavaUnavailableReason::MalformedVersion { path, diagnostics } => format!(
+                "Javaのバージョンを解析できませんでした: {} — {diagnostics}",
+                path.display()
+            ),
+            JavaUnavailableReason::IncompatibleMajor {
+                path,
+                actual,
+                required,
+            } => format!(
+                "{} はJava {}ですが、Java {}が必要です",
+                path.display(),
+                actual,
+                required
+            ),
+        }
+    }
+
+    pub fn lan_unavailable(self, reason: &LanAddressUnavailableReason) -> String {
+        match (self, reason) {
+            (Self::English, LanAddressUnavailableReason::NoUsablePrivateIpv4) => {
+                "Connection endpoint unavailable: no usable private LAN IPv4 address was found. Check that a Wi-Fi or Ethernet adapter is connected.".into()
+            }
+            (Self::Japanese, LanAddressUnavailableReason::NoUsablePrivateIpv4) => {
+                "接続先を表示できません: 使用可能なプライベートLAN IPv4アドレスが見つかりません。Wi-FiまたはEthernetアダプターが接続されているか確認してください。".into()
+            }
+            (Self::English, LanAddressUnavailableReason::AdapterEnumerationFailed(detail)) => {
+                format!("Connection endpoint unavailable: could not enumerate network adapters: {detail}")
+            }
+            (Self::Japanese, LanAddressUnavailableReason::AdapterEnumerationFailed(_)) => {
+                "接続先を表示できません: ネットワークアダプターを確認できません。Wi-FiまたはEthernetアダプターが接続されているか確認してください。".into()
+            }
         }
     }
 
@@ -347,8 +445,9 @@ pub fn save_language(root: &Path, language: Language) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Language, UiText, load_language, save_language};
-    use minedock_core::WorldStatus;
+    use super::{JavaStatus, Language, UiText, load_language, save_language};
+    use crate::network::LanAddressUnavailableReason;
+    use minedock_core::{JavaUnavailableReason, WorldStatus};
     use tempfile::TempDir;
 
     #[test]
@@ -381,6 +480,21 @@ mod tests {
         assert_eq!(
             Language::English.template_name("hardcore", "Hardcore"),
             "Hardcore"
+        );
+    }
+
+    #[test]
+    fn japanese_common_error_states_are_localized() {
+        assert_eq!(
+            Language::Japanese.java_status(&JavaStatus::Unavailable {
+                reason: Some(JavaUnavailableReason::NoCandidates),
+            }),
+            "Java実行ファイルが見つかりません。"
+        );
+        assert!(
+            !Language::Japanese
+                .lan_unavailable(&LanAddressUnavailableReason::NoUsablePrivateIpv4)
+                .starts_with("Connection endpoint unavailable")
         );
     }
 }
