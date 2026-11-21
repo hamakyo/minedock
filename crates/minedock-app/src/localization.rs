@@ -1,6 +1,8 @@
 use crate::network::LanAddressUnavailableReason;
 use atomic_write_file::AtomicWriteFile;
-use minedock_core::{Difficulty, GameMode, JavaReadiness, JavaUnavailableReason, WorldStatus};
+use minedock_core::{
+    BackupReason, Difficulty, GameMode, JavaReadiness, JavaUnavailableReason, WorldStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -60,6 +62,9 @@ pub enum UiText {
     SettingsError,
     WorldDescription,
     JavaSettings,
+    Diagnostics,
+    DiagnosticsSaved,
+    DiagnosticsFailed,
     JavaPath,
     JavaPathPlaceholder,
     JavaSettingsHint,
@@ -70,6 +75,16 @@ pub enum UiText {
     Details,
     RecentLogs,
     NoRecentLogs,
+    PlayerActivity,
+    PlayersUnknown,
+    Playtime,
+    LastBackup,
+    NoBackups,
+    BackupHistory,
+    NoBackupHistory,
+    BackupNow,
+    RetryBackup,
+    ContinueWithoutBackup,
     WorldStatusLabel,
     Version,
     Port,
@@ -257,6 +272,12 @@ impl Language {
             }
             (Self::English, UiText::JavaSettings) => "Java settings",
             (Self::Japanese, UiText::JavaSettings) => "Java設定",
+            (Self::English, UiText::Diagnostics) => "Diagnostics",
+            (Self::Japanese, UiText::Diagnostics) => "診断情報",
+            (Self::English, UiText::DiagnosticsSaved) => "Diagnostics saved",
+            (Self::Japanese, UiText::DiagnosticsSaved) => "診断情報を保存しました",
+            (Self::English, UiText::DiagnosticsFailed) => "Could not save diagnostics",
+            (Self::Japanese, UiText::DiagnosticsFailed) => "診断情報を保存できませんでした",
             (Self::English, UiText::JavaPath) => "Java executable path (optional)",
             (Self::Japanese, UiText::JavaPath) => "Java実行ファイルのパス（任意）",
             (Self::English, UiText::JavaPathPlaceholder) => "Leave empty to use JAVA_HOME or PATH",
@@ -293,6 +314,26 @@ impl Language {
                 "No recent server output has been collected yet."
             }
             (Self::Japanese, UiText::NoRecentLogs) => "最近のサーバー出力はまだありません。",
+            (Self::English, UiText::PlayerActivity) => "Player activity",
+            (Self::Japanese, UiText::PlayerActivity) => "プレイヤーの活動",
+            (Self::English, UiText::PlayersUnknown) => "Player count is not known yet.",
+            (Self::Japanese, UiText::PlayersUnknown) => "プレイヤー数はまだ取得できていません。",
+            (Self::English, UiText::Playtime) => "playtime",
+            (Self::Japanese, UiText::Playtime) => "プレイ時間",
+            (Self::English, UiText::LastBackup) => "Last backup",
+            (Self::Japanese, UiText::LastBackup) => "最終バックアップ",
+            (Self::English, UiText::NoBackups) => "No local backup has been created yet.",
+            (Self::Japanese, UiText::NoBackups) => "ローカルバックアップはまだありません。",
+            (Self::English, UiText::BackupHistory) => "Backup history",
+            (Self::Japanese, UiText::BackupHistory) => "バックアップ履歴",
+            (Self::English, UiText::NoBackupHistory) => "No backup history is available.",
+            (Self::Japanese, UiText::NoBackupHistory) => "バックアップ履歴はありません。",
+            (Self::English, UiText::BackupNow) => "BACKUP NOW",
+            (Self::Japanese, UiText::BackupNow) => "今すぐバックアップ",
+            (Self::English, UiText::RetryBackup) => "RETRY BACKUP",
+            (Self::Japanese, UiText::RetryBackup) => "バックアップを再試行",
+            (Self::English, UiText::ContinueWithoutBackup) => "CONTINUE WITHOUT BACKUP",
+            (Self::Japanese, UiText::ContinueWithoutBackup) => "バックアップなしで続行",
             (Self::English, UiText::WorldStatusLabel) => "Status",
             (Self::Japanese, UiText::WorldStatusLabel) => "状態",
             (Self::English, UiText::Version) => "Version",
@@ -520,6 +561,17 @@ impl Language {
             (Self::Japanese, Difficulty::Normal) => "ノーマル",
             (Self::English, Difficulty::Hard) => "Hard",
             (Self::Japanese, Difficulty::Hard) => "ハード",
+        }
+    }
+
+    pub fn backup_reason(self, reason: BackupReason) -> &'static str {
+        match (self, reason) {
+            (Self::English, BackupReason::Shutdown) => "shutdown",
+            (Self::Japanese, BackupReason::Shutdown) => "シャットダウン",
+            (Self::English, BackupReason::Manual) => "manual",
+            (Self::Japanese, BackupReason::Manual) => "手動",
+            (Self::English, BackupReason::PreUpgrade) => "pre-upgrade",
+            (Self::Japanese, BackupReason::PreUpgrade) => "アップグレード前",
         }
     }
 }

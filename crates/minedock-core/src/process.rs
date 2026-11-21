@@ -231,6 +231,12 @@ impl SessionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn parse(value: impl AsRef<str>) -> Result<Self> {
+        Uuid::parse_str(value.as_ref())
+            .map(Self)
+            .map_err(|error| MineDockError::Persistence(format!("invalid session id: {error}")))
+    }
 }
 
 impl Default for SessionId {
@@ -245,7 +251,8 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LogStream {
     Stdout,
     Stderr,
@@ -482,6 +489,7 @@ where
     lease_provider: L,
     reservations: WorldReservations,
     sessions: std::collections::HashMap<WorldId, ManagedSession<F::Process, L::Lease>>,
+    backup_pending: HashSet<WorldId>,
 }
 
 impl<P, F, L> std::fmt::Debug for LifecycleSupervisor<P, F, L>
@@ -498,6 +506,7 @@ where
             .field("persistence", &self.persistence)
             .field("factory", &self.factory)
             .field("sessions", &self.sessions.len())
+            .field("backup_pending", &self.backup_pending)
             .finish()
     }
 }
@@ -515,6 +524,7 @@ where
             lease_provider,
             reservations: WorldReservations::default(),
             sessions: std::collections::HashMap::new(),
+            backup_pending: HashSet::new(),
         }
     }
 
@@ -695,7 +705,7 @@ where
     /// Returns `Ok(None)` when no active session exists, making repeated stop
     /// requests for a persisted Stopped world idempotent.
     pub fn stop(&mut self, world_id: WorldId, timeout: Duration) -> Result<Option<StopOutcome>> {
-        self.stop_inner(world_id, timeout, None)
+        self.stop_inner(world_id, timeout, None, false)
             .map(|(outcome, _events)| outcome)
     }
 
@@ -709,7 +719,53 @@ where
         timeout: Duration,
         max_raw: usize,
     ) -> Result<(Option<StopOutcome>, Vec<ServerEvent>)> {
-        self.stop_inner(world_id, timeout, Some(max_raw))
+        self.stop_inner(world_id, timeout, Some(max_raw), false)
+    }
+
+    /// Stop a world and persist `BackingUp` as the authoritative post-process
+    /// state before the managed session is released. The app can then perform
+    /// the filesystem snapshot without exposing a Stopped/BackingUp crash
+    /// gap. A failed backup must explicitly resolve itself before a later
+    /// start, while a successful backup transitions to Stopped in the app
+    /// persistence adapter.
+    pub fn stop_with_events_for_backup(
+        &mut self,
+        world_id: WorldId,
+        timeout: Duration,
+        max_raw: usize,
+    ) -> Result<(Option<StopOutcome>, Vec<ServerEvent>)> {
+        self.stop_inner(world_id, timeout, Some(max_raw), true)
+    }
+
+    /// Commit the successful filesystem backup and release the authoritative
+    /// `BackingUp` state. The pending set prevents a caller from claiming a
+    /// backup completion for a world that did not cross the core stop
+    /// boundary.
+    pub fn complete_backup(&mut self, world_id: WorldId) -> Result<()> {
+        if !self.backup_pending.contains(&world_id) {
+            return Err(MineDockError::InvalidState(
+                "world has no pending backup completion".into(),
+            ));
+        }
+        self.persistence
+            .persist_status(world_id, WorldStatus::Stopped)?;
+        self.backup_pending.remove(&world_id);
+        Ok(())
+    }
+
+    /// Persist a failed backup outcome through the same lifecycle owner. The
+    /// caller must still keep a durable recovery marker so the user can
+    /// explicitly retry or continue without a backup after a restart.
+    pub fn fail_backup(&mut self, world_id: WorldId) -> Result<()> {
+        if !self.backup_pending.contains(&world_id) {
+            return Err(MineDockError::InvalidState(
+                "world has no pending backup failure".into(),
+            ));
+        }
+        self.persistence
+            .persist_status(world_id, WorldStatus::Failed)?;
+        self.backup_pending.remove(&world_id);
+        Ok(())
     }
 
     fn stop_inner(
@@ -717,6 +773,7 @@ where
         world_id: WorldId,
         timeout: Duration,
         max_raw: Option<usize>,
+        backup_after_success: bool,
     ) -> Result<(Option<StopOutcome>, Vec<ServerEvent>)> {
         let Some(session) = self.sessions.get(&world_id) else {
             return Ok((None, Vec::new()));
@@ -767,7 +824,11 @@ where
             }
             GracefulStopResult::Exited { exit } => {
                 let target = if exit.success {
-                    WorldStatus::Stopped
+                    if backup_after_success {
+                        WorldStatus::BackingUp
+                    } else {
+                        WorldStatus::Stopped
+                    }
                 } else {
                     WorldStatus::Failed
                 };
@@ -782,6 +843,9 @@ where
                     .persist_session(world_id, target, None, None)?;
                 self.persistence.clear_process_id(world_id)?;
                 self.sessions.remove(&world_id);
+                if backup_after_success {
+                    self.backup_pending.insert(world_id);
+                }
                 Ok((Some(StopOutcome::Exited { exit }), events))
             }
         }
@@ -811,6 +875,16 @@ where
         world_id: WorldId,
         token: StopEscalationToken,
     ) -> Result<ProcessExit> {
+        self.force_terminate_with_events(world_id, token, 0)
+            .map(|(exit, _events)| exit)
+    }
+
+    pub fn force_terminate_with_events(
+        &mut self,
+        world_id: WorldId,
+        token: StopEscalationToken,
+        max_raw: usize,
+    ) -> Result<(ProcessExit, Vec<ServerEvent>)> {
         let session = self
             .sessions
             .get_mut(&world_id)
@@ -828,10 +902,15 @@ where
             ));
         }
         let exit = session.process.force_terminate(token)?;
+        let events = if max_raw == 0 {
+            Vec::new()
+        } else {
+            drain_all_process_events(&session.process, max_raw)
+        };
         self.persistence
             .persist_session(world_id, WorldStatus::Failed, None, None)?;
         self.sessions.remove(&world_id);
-        Ok(exit)
+        Ok((exit, events))
     }
 
     pub fn poll_exit(&mut self, world_id: WorldId) -> Result<Option<ProcessExit>> {
@@ -1261,6 +1340,39 @@ mod tests {
             )
         }));
         assert_eq!(supervisor.session_id(world_id), None);
+        assert_eq!(
+            supervisor.persistence().status(world_id),
+            Some(WorldStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn stop_for_backup_persists_backing_up_before_session_removal() {
+        let world_id = WorldId::new();
+        let mut supervisor = LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            FinalEventFactory::default(),
+            TestLeaseProvider,
+        );
+        supervisor
+            .start(Path::new("."), world_id, || Ok(test_spec(world_id)))
+            .expect("start");
+
+        let (outcome, _) = supervisor
+            .stop_with_events_for_backup(world_id, Duration::from_millis(1), 64)
+            .expect("stop for backup");
+        assert!(matches!(
+            outcome,
+            Some(StopOutcome::Exited { exit }) if exit.success
+        ));
+        assert_eq!(supervisor.session_id(world_id), None);
+        assert_eq!(
+            supervisor.persistence().status(world_id),
+            Some(WorldStatus::BackingUp)
+        );
+        supervisor
+            .complete_backup(world_id)
+            .expect("backup complete");
         assert_eq!(
             supervisor.persistence().status(world_id),
             Some(WorldStatus::Stopped)

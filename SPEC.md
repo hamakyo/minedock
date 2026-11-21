@@ -205,14 +205,17 @@ Log parsing must be best-effort and must not control critical lifecycle transiti
 ## 9. Backup
 
 MVP backup type:
-- local compressed archive or safe directory snapshot after server shutdown.
+- local verified ZIP archive after server shutdown; a pre-archive directory
+  snapshot is not a current backup contract.
 
 Backup metadata:
 - world id
 - timestamp
 - size
+- uncompressed size and completed archive size
 - reason (`manual`, `shutdown`, `pre-upgrade`)
 - Minecraft version
+- per-file and completed-archive integrity digest
 
 Restore is post-v0.1 unless it can be implemented safely without delaying the MVP.
 

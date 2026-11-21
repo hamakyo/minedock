@@ -1,6 +1,6 @@
 # Security Notes
 
-This document distinguishes controls present in the Phase 0–5 foundations from the Phase 6 GPUI Start/EULA/Stop workflow and the remaining MVP work. The current GPUI can begin provider-backed server preparation from a stopped world and exposes conservative LAN endpoint candidates; backups remain open.
+This document distinguishes controls present in the Phase 0–5 foundations from the Phase 6 GPUI Start/EULA/Stop workflow and the remaining MVP work. The current GPUI can begin provider-backed server preparation from a stopped world, exposes conservative LAN endpoint candidates, and creates verified local ZIP backups; clean Windows acceptance and native verification debt remain open.
 
 ## Defaults
 
@@ -52,12 +52,18 @@ The GPUI EULA notice and confirmation dialog now connect the explicit `I Agree` 
 
 ## Archive rules
 
-When backup restore/import is implemented:
-- reject absolute archive paths;
-- reject `..` traversal;
-- reject links escaping target root;
-- extract into temporary directory;
-- validate before atomic move.
+Current backup archive controls:
+- create only from an authoritative `Stopped` world;
+- store selected entries as a ZIP plus a sidecar schema-versioned manifest;
+- reject absolute/traversal archive entry names, links, reparse points, and
+  unsupported entries;
+- verify per-entry sizes/digests and the completed archive digest before
+  normal backup reads expose the record;
+- reconcile startup indexes using manifest/central-directory structure only;
+  full digest verification runs in a worker.
+
+When backup restore/import is implemented, retain the same path checks, extract
+into a temporary directory, and validate before an atomic move.
 
 ## Process rules
 

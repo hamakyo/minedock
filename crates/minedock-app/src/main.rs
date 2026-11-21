@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::Utc;
 use gpui::{
     App, Application, Bounds, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
@@ -19,12 +20,16 @@ use gpui::{
     relative, rgb, rgba, size,
 };
 use minedock_core::{
-    CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository, JavaReadiness,
-    JavaRuntime, JsonWorldRepository, LaunchSpec, LifecycleSupervisor, LogStream, MineDockError,
-    OFFICIAL_EULA_URL, ProcessExit, ServerEvent, SessionId, StopEscalationToken, StopOutcome,
-    TemplateCatalog, TemplateId, World, WorldId, WorldLibrary, WorldStatus, normalize_world_name,
+    BackupReason, BackupRecord, CreateWorldRequest, EulaAcceptanceRepository,
+    FileEulaAcceptanceRepository, JavaReadiness, JavaRuntime, JsonWorldRepository, LaunchSpec,
+    LifecyclePersistence, LifecycleSupervisor, LogStream, MineDockError, OFFICIAL_EULA_URL,
+    PlayerActivityTracker, PresenceBaseline, ProcessExit, ServerEvent, SessionExitReason,
+    SessionId, StopEscalationToken, StopOutcome, TemplateCatalog, TemplateId, World, WorldId,
+    WorldLibrary, WorldRepository, WorldStatus, normalize_world_name,
 };
 
+mod backup;
+mod diagnostics;
 #[allow(dead_code)]
 mod http_transport;
 mod java_adapter;
@@ -33,6 +38,7 @@ mod localization;
 mod native_process;
 mod native_safety;
 mod network;
+mod session_store;
 
 use localization::{JavaStatus, Language, UiAction, UiText};
 use network::LanAddressState;
@@ -44,13 +50,32 @@ type AppLifecycle = LifecycleSupervisor<
 >;
 type LifecyclePollResult = (WorldId, minedock_core::Result<Option<ProcessExit>>);
 type LifecyclePollResults = Vec<LifecyclePollResult>;
-type LifecyclePollEventResult = (
-    WorldId,
-    minedock_core::Result<(Option<ProcessExit>, Vec<ServerEvent>)>,
+type LifecyclePollEventPayload = (
+    Option<ProcessExit>,
+    Vec<ServerEvent>,
+    Option<session_store::SessionSnapshot>,
+    Option<String>,
 );
+type LifecyclePollEventResult = (WorldId, minedock_core::Result<LifecyclePollEventPayload>);
 type LifecyclePollEventResults = Vec<LifecyclePollEventResult>;
-type LifecycleStopEventResult = minedock_core::Result<(Option<StopOutcome>, Vec<ServerEvent>)>;
+
+struct LifecycleStopEventResult {
+    outcome: minedock_core::Result<Option<StopOutcome>>,
+    events: Vec<ServerEvent>,
+    session_error: Option<String>,
+}
+
 type LifecycleStopEventBatch<P, F, L> = (LifecycleSupervisor<P, F, L>, LifecycleStopEventResult);
+
+struct LifecycleForceStopEventResult {
+    outcome: minedock_core::Result<ProcessExit>,
+    events: Vec<ServerEvent>,
+    session_error: Option<String>,
+}
+
+type LifecycleForceStopEventBatch<P, F, L> =
+    (LifecycleSupervisor<P, F, L>, LifecycleForceStopEventResult);
+type BackupExecutionResult = minedock_core::Result<(BackupRecord, Vec<BackupRecord>)>;
 
 struct PreparedLaunch {
     launch_spec: LaunchSpec,
@@ -69,6 +94,7 @@ enum LifecycleOperation {
     Starting(WorldId),
     Stopping(WorldId),
     ForceStopping(WorldId),
+    BackingUp(WorldId),
     Polling,
 }
 
@@ -81,6 +107,26 @@ enum WorldAction {
 }
 
 const MAX_RECENT_LOG_LINES: usize = 80;
+
+fn format_playtime(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn format_backup_record(language: Language, record: &BackupRecord) -> String {
+    format!(
+        "{} · {} · Minecraft {} · {} bytes",
+        record.created_at.to_rfc3339(),
+        language.backup_reason(record.reason),
+        record.manifest.minecraft_version,
+        record.manifest.archive_bytes,
+    )
+}
 
 #[derive(Debug, Clone)]
 struct RecentLogLine {
@@ -126,8 +172,13 @@ fn prepare_launch(
     eula: &FileEulaAcceptanceRepository,
     configured_java_path: Option<&Path>,
 ) -> minedock_core::Result<PreparedLaunch> {
+    native_safety::ensure_free_space(app_data_root, 256 * 1024 * 1024)?;
     let provider = http_transport::production_vanilla_provider(app_data_root.join("downloads"))?;
     let resolved = provider.resolve_version(&world.server.version_selector()?)?;
+    native_safety::ensure_free_space(
+        app_data_root,
+        resolved.artifact.size.saturating_add(256 * 1024 * 1024),
+    )?;
     let readiness = java_adapter::discover_java_off_event_loop(
         resolved.java_requirement,
         configured_java_path.map(Path::to_path_buf),
@@ -173,23 +224,35 @@ fn execute_start(
     eula: FileEulaAcceptanceRepository,
     configured_java_path: Option<PathBuf>,
     progress: Sender<StartProgress>,
+    session_store: session_store::SessionLogStore,
 ) -> (
     AppLifecycle,
     Option<JavaStatus>,
     minedock_core::Result<SessionId>,
 ) {
     let mut java_status = None;
-    let (lifecycle, result) = execute_lifecycle_start(lifecycle, &app_data_root, world.id, || {
-        let prepared = prepare_launch(
-            &app_data_root,
-            &world,
-            &eula,
-            configured_java_path.as_deref(),
-        )?;
-        java_status = Some(prepared.java_status);
-        let _ = progress.send(StartProgress::Starting);
-        Ok(prepared.launch_spec)
-    });
+    let (mut lifecycle, result) =
+        execute_lifecycle_start(lifecycle, &app_data_root, world.id, || {
+            let prepared = prepare_launch(
+                &app_data_root,
+                &world,
+                &eula,
+                configured_java_path.as_deref(),
+            )?;
+            java_status = Some(prepared.java_status);
+            let _ = progress.send(StartProgress::Starting);
+            Ok(prepared.launch_spec)
+        });
+    let result = match result {
+        Ok(session_id) => match session_store.begin_session(world.id, session_id, None) {
+            Ok(()) => Ok(session_id),
+            Err(error) => {
+                let _ = lifecycle.stop(world.id, STOP_TIMEOUT);
+                Err(error)
+            }
+        },
+        Err(error) => Err(error),
+    };
     (lifecycle, java_status, result)
 }
 
@@ -220,6 +283,7 @@ fn poll_exit_allowed(
         Some(LifecycleOperation::Stopping(world_id)) => pending_force_stop_world == Some(world_id),
         Some(LifecycleOperation::Starting(_))
         | Some(LifecycleOperation::ForceStopping(_))
+        | Some(LifecycleOperation::BackingUp(_))
         | Some(LifecycleOperation::Polling) => false,
     }
 }
@@ -268,16 +332,60 @@ where
 fn execute_lifecycle_stop_with_events<P, F, L>(
     mut lifecycle: LifecycleSupervisor<P, F, L>,
     world_id: WorldId,
+    backup_after_stop: bool,
+    session_store: Option<session_store::SessionLogStore>,
 ) -> LifecycleStopEventBatch<P, F, L>
 where
     P: minedock_core::LifecyclePersistence,
     F: minedock_core::ProcessFactory,
     L: minedock_core::LifecycleLeaseProvider,
 {
-    let result = lifecycle.stop_with_events(world_id, STOP_TIMEOUT, 64);
-    (lifecycle, result)
+    let session_id = lifecycle.session_id(world_id);
+    let result = if backup_after_stop {
+        lifecycle.stop_with_events_for_backup(world_id, STOP_TIMEOUT, 64)
+    } else {
+        lifecycle.stop_with_events(world_id, STOP_TIMEOUT, 64)
+    };
+    let (outcome, events) = match result {
+        Ok((outcome, events)) => (Ok(outcome), events),
+        Err(error) => (Err(error), Vec::new()),
+    };
+    let mut session_error = None;
+    if let (Some(store), Some(session_id)) = (session_store, session_id) {
+        if outcome.is_ok() {
+            if let Err(error) = store.append_events(world_id, session_id, &events) {
+                append_session_error(&mut session_error, error);
+            }
+            if let Some(outcome) = outcome.as_ref().ok().and_then(Option::as_ref) {
+                let reason = match outcome {
+                    StopOutcome::Exited { exit } if exit.success => {
+                        Some(SessionExitReason::Graceful { code: exit.code })
+                    }
+                    StopOutcome::Exited { exit } => Some(SessionExitReason::Unexpected {
+                        code: exit.code,
+                        success: exit.success,
+                    }),
+                    StopOutcome::TimedOut(_) => None,
+                };
+                if let Some(reason) = reason {
+                    if let Err(error) = store.finalize(world_id, session_id, reason) {
+                        append_session_error(&mut session_error, error);
+                    }
+                }
+            }
+        }
+    }
+    (
+        lifecycle,
+        LifecycleStopEventResult {
+            outcome,
+            events,
+            session_error,
+        },
+    )
 }
 
+#[allow(dead_code)]
 fn execute_lifecycle_force_stop<P, F, L>(
     mut lifecycle: LifecycleSupervisor<P, F, L>,
     world_id: WorldId,
@@ -293,6 +401,171 @@ where
 {
     let result = lifecycle.force_terminate(world_id, token);
     (lifecycle, result)
+}
+
+fn execute_lifecycle_force_stop_with_events<P, F, L>(
+    mut lifecycle: LifecycleSupervisor<P, F, L>,
+    world_id: WorldId,
+    token: StopEscalationToken,
+    session_store: Option<session_store::SessionLogStore>,
+) -> LifecycleForceStopEventBatch<P, F, L>
+where
+    P: minedock_core::LifecyclePersistence,
+    F: minedock_core::ProcessFactory,
+    L: minedock_core::LifecycleLeaseProvider,
+{
+    let session_id = lifecycle.session_id(world_id);
+    let result = lifecycle.force_terminate_with_events(world_id, token, 64);
+    let (outcome, events) = match result {
+        Ok((exit, events)) => (Ok(exit), events),
+        Err(error) => (Err(error), Vec::new()),
+    };
+    let mut session_error = None;
+    if let (Some(store), Some(session_id)) = (session_store, session_id) {
+        if outcome.is_ok() {
+            if let Err(error) = store.append_events(world_id, session_id, &events) {
+                append_session_error(&mut session_error, error);
+            }
+            if let Ok(exit) = outcome.as_ref() {
+                if let Err(error) = store.finalize(
+                    world_id,
+                    session_id,
+                    SessionExitReason::ForceStopped { code: exit.code },
+                ) {
+                    append_session_error(&mut session_error, error);
+                }
+            }
+        }
+    }
+    (
+        lifecycle,
+        LifecycleForceStopEventResult {
+            outcome,
+            events,
+            session_error,
+        },
+    )
+}
+
+fn append_session_error(slot: &mut Option<String>, error: MineDockError) {
+    let message = error.to_string();
+    match slot {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&message);
+        }
+        None => *slot = Some(message),
+    }
+}
+
+fn session_log_warning(error: String) -> String {
+    format!("Session log persistence failed; lifecycle state remains authoritative: {error}")
+}
+
+fn append_optional_warning(message: String, warning: Option<String>) -> String {
+    match warning {
+        Some(warning) => format!("{message} {warning}"),
+        None => message,
+    }
+}
+
+fn execute_automatic_backup(
+    lifecycle: AppLifecycle,
+    engine: backup::SafeBackupEngine,
+    world: World,
+) -> (AppLifecycle, BackupExecutionResult) {
+    execute_backup_with_recovery(lifecycle, engine, world, BackupReason::Shutdown, true)
+}
+
+fn execute_recovery_backup(
+    lifecycle: AppLifecycle,
+    engine: backup::SafeBackupEngine,
+    world: World,
+) -> (AppLifecycle, BackupExecutionResult) {
+    execute_backup_with_recovery(lifecycle, engine, world, BackupReason::Manual, false)
+}
+
+fn execute_backup_with_recovery(
+    mut lifecycle: AppLifecycle,
+    engine: backup::SafeBackupEngine,
+    world: World,
+    reason: BackupReason,
+    core_backup_pending: bool,
+) -> (AppLifecycle, BackupExecutionResult) {
+    // Automatic shutdown enters this worker from core's persisted BackingUp
+    // boundary. Recovery retries use the same durable failure contract. Never
+    // fall back to Stopped on an error: the recovery marker and Failed state
+    // keep Start disabled until the user explicitly resolves the failure.
+    let result: BackupExecutionResult = (|| {
+        let record = engine.create(&world, reason)?;
+        let records = engine.retain(world.id, world.backup.retain)?;
+        engine.clear_recovery_required(world.id)?;
+        if core_backup_pending {
+            lifecycle.complete_backup(world.id)?;
+        } else {
+            lifecycle
+                .persistence_mut()
+                .persist_status(world.id, WorldStatus::Stopped)?;
+        }
+        Ok((record, records))
+    })();
+    let result = match result {
+        Ok(record) => Ok(record),
+        Err(error) => {
+            let mut recovery_errors = vec![error.to_string()];
+            if let Err(recovery_error) = engine.mark_recovery_required(world.id) {
+                recovery_errors.push(format!(
+                    "could not persist backup recovery marker: {recovery_error}"
+                ));
+            }
+            let status_result = if core_backup_pending {
+                lifecycle.fail_backup(world.id)
+            } else {
+                lifecycle
+                    .persistence_mut()
+                    .persist_status(world.id, WorldStatus::Failed)
+            };
+            if let Err(status_error) = status_result {
+                recovery_errors.push(format!(
+                    "could not persist Failed backup state: {status_error}"
+                ));
+            }
+            Err(MineDockError::Backup(recovery_errors.join("; ")))
+        }
+    };
+    (lifecycle, result)
+}
+
+fn execute_continue_without_backup(
+    mut lifecycle: AppLifecycle,
+    engine: backup::SafeBackupEngine,
+    world_id: WorldId,
+) -> (AppLifecycle, minedock_core::Result<()>) {
+    let result = (|| {
+        // Persist Stopped before removing the recovery marker. If the app
+        // stops between these writes, the marker still keeps Start disabled.
+        lifecycle
+            .persistence_mut()
+            .persist_status(world_id, WorldStatus::Stopped)?;
+        engine.clear_recovery_required(world_id)
+    })();
+    let result = match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = engine.mark_recovery_required(world_id);
+            let _ = lifecycle
+                .persistence_mut()
+                .persist_status(world_id, WorldStatus::Failed);
+            Err(error)
+        }
+    };
+    (lifecycle, result)
+}
+
+fn execute_manual_backup(engine: backup::SafeBackupEngine, world: World) -> BackupExecutionResult {
+    let record = engine.create(&world, BackupReason::Manual)?;
+    let records = engine.retain(world.id, world.backup.retain)?;
+    Ok((record, records))
 }
 
 #[allow(dead_code)]
@@ -318,6 +591,8 @@ where
 fn execute_lifecycle_poll_and_drain<P, F, L>(
     mut lifecycle: LifecycleSupervisor<P, F, L>,
     world_ids: impl IntoIterator<Item = WorldId>,
+    pending_force_stop_world: Option<WorldId>,
+    session_store: Option<session_store::SessionLogStore>,
 ) -> (LifecycleSupervisor<P, F, L>, LifecyclePollEventResults)
 where
     P: minedock_core::LifecyclePersistence,
@@ -327,13 +602,44 @@ where
     let results = world_ids
         .into_iter()
         .map(|world_id| {
+            let session_id = lifecycle.session_id(world_id);
             let result = lifecycle.poll_exit_with_events(world_id, 64);
+            let result = match (session_store.as_ref(), session_id, result) {
+                (Some(store), Some(session_id), Ok((exit, events))) => {
+                    let mut session_error = None;
+                    if let Err(error) = store.append_events(world_id, session_id, &events) {
+                        append_session_error(&mut session_error, error);
+                    }
+                    if let Some(exit) = exit {
+                        let reason = if pending_force_stop_world == Some(world_id) && exit.success {
+                            SessionExitReason::GracefulAfterTimeout { code: exit.code }
+                        } else {
+                            SessionExitReason::Unexpected {
+                                code: exit.code,
+                                success: exit.success,
+                            }
+                        };
+                        if let Err(error) = store.finalize(world_id, session_id, reason) {
+                            append_session_error(&mut session_error, error);
+                        }
+                    }
+                    let snapshot = match store.latest_snapshot(world_id) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            append_session_error(&mut session_error, error);
+                            None
+                        }
+                    };
+                    Ok((exit, events, snapshot, session_error))
+                }
+                (_, _, Ok((exit, events))) => Ok((exit, events, None, None)),
+                (_, _, Err(error)) => Err(error),
+            };
             (world_id, result)
         })
         .collect();
     (lifecycle, results)
 }
-
 actions!(
     text_input,
     [
@@ -1005,6 +1311,14 @@ struct MineDockView {
     details_log_scroll: ScrollHandle,
     selected_world: Option<WorldId>,
     recent_logs: HashMap<WorldId, VecDeque<RecentLogLine>>,
+    session_store: Option<session_store::SessionLogStore>,
+    persisted_sessions: HashMap<WorldId, session_store::SessionSnapshot>,
+    backup_engine: Option<backup::SafeBackupEngine>,
+    latest_backups: HashMap<WorldId, BackupRecord>,
+    backup_history: HashMap<WorldId, Vec<BackupRecord>>,
+    backup_recovery_required: HashSet<WorldId>,
+    backup_error: Option<String>,
+    diagnostics_notice: Option<String>,
 }
 
 impl MineDockView {
@@ -1049,6 +1363,14 @@ impl MineDockView {
                     details_log_scroll: ScrollHandle::new(),
                     selected_world: None,
                     recent_logs: HashMap::new(),
+                    session_store: None,
+                    persisted_sessions: HashMap::new(),
+                    backup_engine: None,
+                    latest_backups: HashMap::new(),
+                    backup_history: HashMap::new(),
+                    backup_recovery_required: HashSet::new(),
+                    backup_error: None,
+                    diagnostics_notice: None,
                 };
             }
         };
@@ -1058,9 +1380,19 @@ impl MineDockView {
         let mut settings_error = None;
         let mut app_data_lease = None;
         let mut lifecycle = None;
+        let mut session_store = None;
+        let mut backup_engine = None;
+        let mut backup_recovery_required = HashSet::new();
+        let mut interrupted_backup_recovery = HashSet::new();
         let library = match resolve_app_data_root() {
             Ok(root) => {
                 let repository = JsonWorldRepository::new(root);
+                session_store = Some(session_store::SessionLogStore::new(
+                    repository.root().to_path_buf(),
+                ));
+                backup_engine = Some(backup::SafeBackupEngine::new(
+                    repository.root().to_path_buf(),
+                ));
                 match lifecycle_adapter::AppDataLease::acquire(repository.root()) {
                     Ok(lease) => {
                         app_data_lease = Some(lease);
@@ -1071,6 +1403,22 @@ impl MineDockView {
                             }
                             Err(error) => settings_error = Some(error),
                         }
+                        match repository.load() {
+                            Ok(metadata) => {
+                                interrupted_backup_recovery.extend(
+                                    metadata
+                                        .worlds
+                                        .into_iter()
+                                        .filter(|world| world.status == WorldStatus::BackingUp)
+                                        .map(|world| world.id),
+                                );
+                            }
+                            Err(error) => {
+                                startup_error = Some(format!(
+                                    "MineDock metadata could not be inspected for backup recovery: {error}"
+                                ));
+                            }
+                        }
                         if let Err(error) =
                             lifecycle_adapter::JsonLifecyclePersistence::recover_startup(
                                 &repository,
@@ -1078,6 +1426,44 @@ impl MineDockView {
                         {
                             startup_error =
                                 Some(format!("MineDock startup recovery failed: {error}"));
+                        }
+                        if startup_error.is_none() {
+                            if let Some(store) = &session_store {
+                                if let Err(error) = store.reconcile_unfinished() {
+                                    startup_error = Some(format!(
+                                        "MineDock session-log recovery failed: {error}"
+                                    ));
+                                }
+                            }
+                        }
+                        if startup_error.is_none() {
+                            if let Some(engine) = &backup_engine {
+                                for world_id in &interrupted_backup_recovery {
+                                    if let Err(error) = engine.mark_recovery_required(*world_id) {
+                                        startup_error = Some(format!(
+                                            "MineDock could not preserve interrupted backup recovery: {error}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if startup_error.is_none() {
+                            if let Err(error) = diagnostics::cleanup_owned_download_temps(
+                                &repository.root().join("downloads"),
+                            ) {
+                                startup_error = Some(format!(
+                                    "MineDock download-cache recovery failed: {error}"
+                                ));
+                            }
+                        }
+                        if startup_error.is_none() {
+                            if let Some(engine) = &backup_engine {
+                                if let Err(error) = engine.recover_stale_partials() {
+                                    startup_error =
+                                        Some(format!("MineDock backup recovery failed: {error}"));
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -1099,6 +1485,24 @@ impl MineDockView {
                 if startup_error.is_none() {
                     if let Err(error) = library.load() {
                         startup_error = Some(format!("MineDock metadata could not load: {error}"));
+                    }
+                }
+                if startup_error.is_none() {
+                    if let Some(engine) = &backup_engine {
+                        for world in library.list() {
+                            match engine.recovery_required(world.id) {
+                                Ok(true) => {
+                                    backup_recovery_required.insert(world.id);
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    startup_error = Some(format!(
+                                        "MineDock backup recovery state could not load: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 Some(library)
@@ -1199,6 +1603,14 @@ impl MineDockView {
             details_log_scroll: ScrollHandle::new(),
             selected_world: None,
             recent_logs: HashMap::new(),
+            session_store,
+            persisted_sessions: HashMap::new(),
+            backup_engine,
+            latest_backups: HashMap::new(),
+            backup_history: HashMap::new(),
+            backup_recovery_required,
+            backup_error: None,
+            diagnostics_notice: None,
         }
     }
 
@@ -1236,6 +1648,36 @@ impl MineDockView {
         self.java_settings_error = None;
         window.focus(&self.java_path_input.focus_handle(cx));
         cx.notify();
+    }
+
+    fn export_diagnostics(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = self.library.as_ref() else {
+            return;
+        };
+        let root = library.repository().root().to_path_buf();
+        let destination = root.join("diagnostics-latest.json");
+        self.diagnostics_notice = None;
+        let worker = cx
+            .background_executor()
+            .spawn(async move { diagnostics::write_diagnostic_bundle(&root, destination) });
+        cx.spawn(async move |this, cx| {
+            let result = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view.diagnostics_notice = Some(match result {
+                    Ok(report) => format!(
+                        "{}: {} — {}",
+                        view.language.text(UiText::DiagnosticsSaved),
+                        report.path.display(),
+                        report.contents_summary
+                    ),
+                    Err(error) => {
+                        format!("{}: {error}", view.language.text(UiText::DiagnosticsFailed))
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn close_java_settings(
@@ -1370,6 +1812,9 @@ impl MineDockView {
     }
 
     fn can_start_world(&self, world_id: WorldId) -> bool {
+        if self.backup_recovery_required.contains(&world_id) {
+            return false;
+        }
         let Some(world) = self
             .library
             .as_ref()
@@ -1472,9 +1917,15 @@ impl MineDockView {
         }
 
         self.active_operation = Some(LifecycleOperation::Polling);
-        let worker = cx
-            .background_executor()
-            .spawn(async move { execute_lifecycle_poll_and_drain(lifecycle, world_ids) });
+        let session_store = self.session_store.clone();
+        let worker = cx.background_executor().spawn(async move {
+            execute_lifecycle_poll_and_drain(
+                lifecycle,
+                world_ids,
+                pending_force_stop_world,
+                session_store,
+            )
+        });
         cx.spawn(async move |this, cx| {
             let (lifecycle, results) = worker.await;
             let _ = this.update(cx, |view, cx| {
@@ -1489,8 +1940,19 @@ impl MineDockView {
                     .map(|(world_id, _)| *world_id);
                 for (world_id, result) in results {
                     match result {
-                        Ok((exit, events)) => {
+                        Ok((exit, events, snapshot, session_error)) => {
                             view.record_server_events(world_id, events);
+                            if let Some(error) = session_error {
+                                errors.push(session_log_warning(error));
+                            }
+                            if let Some(snapshot) = snapshot {
+                                // Keep the details projection live while the
+                                // server is running. The snapshot contains
+                                // persisted join timestamps, so the renderer
+                                // can recompute open-interval playtime on each
+                                // poll notification without reopening details.
+                                view.persisted_sessions.insert(world_id, snapshot);
+                            }
                             match exit {
                                 Some(exit) => {
                                     should_reload = true;
@@ -1555,6 +2017,9 @@ impl MineDockView {
                                 None => refresh_error,
                             });
                         }
+                    }
+                    if let Some(world_id) = view.selected_world {
+                        view.load_persisted_world_state(world_id, cx);
                     }
                 }
                 cx.notify();
@@ -1621,9 +2086,16 @@ impl MineDockView {
             cx.notify();
             return;
         };
+        let Some(session_store) = self.session_store.clone() else {
+            self.lifecycle_error = Some("The session log store is unavailable.".into());
+            self._lifecycle = Some(lifecycle);
+            cx.notify();
+            return;
+        };
 
         self.active_operation = Some(LifecycleOperation::Starting(world_id));
         clear_recent_logs_for_new_session(&mut self.recent_logs, world_id);
+        self.persisted_sessions.remove(&world_id);
         self.status_overrides
             .insert(world_id, WorldStatus::Preparing);
         self.lifecycle_error = None;
@@ -1640,6 +2112,7 @@ impl MineDockView {
                 eula,
                 configured_java_path,
                 progress_sender,
+                session_store,
             );
             completed_by_worker.store(true, Ordering::Release);
             result
@@ -1728,6 +2201,13 @@ impl MineDockView {
             cx.notify();
             return;
         };
+        let backup_after_stop = self
+            .library
+            .as_ref()
+            .and_then(|library| library.get(world_id))
+            .is_some_and(|world| {
+                world.backup.enabled && world.backup.on_shutdown && self.backup_engine.is_some()
+            });
 
         self.active_operation = Some(LifecycleOperation::Stopping(world_id));
         self.pending_force_stop = None;
@@ -1736,56 +2216,112 @@ impl MineDockView {
         self.lifecycle_error = None;
         cx.notify();
 
-        let worker = cx
-            .background_executor()
-            .spawn(async move { execute_lifecycle_stop_with_events(lifecycle, world_id) });
+        let session_store = self.session_store.clone();
+        let worker = cx.background_executor().spawn(async move {
+            execute_lifecycle_stop_with_events(
+                lifecycle,
+                world_id,
+                backup_after_stop,
+                session_store,
+            )
+        });
         cx.spawn(async move |this, cx| {
             let (lifecycle, result) = worker.await;
             let _ = this.update(cx, |view, cx| {
-                view._lifecycle = Some(lifecycle);
-                match result {
-                    Ok((outcome, events)) => {
-                        view.record_server_events(world_id, events);
-                        match outcome {
-                            Some(StopOutcome::Exited { exit }) => {
-                                view.active_operation = None;
-                                view.pending_force_stop = None;
-                                view.status_overrides.remove(&world_id);
-                                view.lifecycle_error = if exit.success {
-                                    None
-                                } else {
-                                    Some(format!(
-                                        "World stop completed with a failure (exit code {:?}); it was marked Failed.",
-                                        exit.code
-                                    ))
-                                };
+                let mut lifecycle = Some(lifecycle);
+                let mut start_backup: Option<(World, Option<String>)> = None;
+                let LifecycleStopEventResult {
+                    outcome,
+                    events,
+                    session_error,
+                } = result;
+                view.record_server_events(world_id, events);
+                let session_warning = session_error.map(session_log_warning);
+                match outcome {
+                    Ok(Some(StopOutcome::Exited { exit })) => {
+                        view.pending_force_stop = None;
+                        view.lifecycle_error = if exit.success {
+                            if view
+                                .library
+                                .as_ref()
+                                .and_then(|library| library.get(world_id))
+                                .is_some_and(|world| {
+                                    world.backup.enabled && world.backup.on_shutdown
+                                })
+                                && view.backup_engine.is_some()
+                            {
+                                start_backup = view
+                                    .library
+                                    .as_ref()
+                                    .and_then(|library| library.get(world_id))
+                                    .cloned()
+                                    .map(|mut world| {
+                                        // The lifecycle supervisor has already
+                                        // authoritatively reached BackingUp; the
+                                        // backup source is a stopped world snapshot.
+                                        world.status = WorldStatus::Stopped;
+                                        (world, session_warning.clone())
+                                    });
+                                Some(match session_warning {
+                                    Some(warning) => format!(
+                                        "World stopped safely; creating a local backup… {warning}"
+                                    ),
+                                    None => "World stopped safely; creating a local backup…".into(),
+                                })
+                            } else {
+                                session_warning
                             }
-                            Some(StopOutcome::TimedOut(token)) => {
-                                view.active_operation =
-                                    Some(LifecycleOperation::Stopping(world_id));
-                                view.pending_force_stop = Some((world_id, token));
-                                view.status_overrides
-                                    .insert(world_id, WorldStatus::Stopping);
-                                view.lifecycle_error = Some(
-                                    "Graceful stop timed out; the server is still running. Use Force Stop only if you accept possible data loss.".into(),
-                                );
-                            }
-                            None => {
-                                view.active_operation = None;
-                                view.pending_force_stop = None;
-                                view.status_overrides.remove(&world_id);
-                                view.lifecycle_error = Some(
-                                    "MineDock could not stop this world because no active lifecycle session was found.".into(),
-                                );
-                            }
-                        }
+                        } else {
+                            Some(append_optional_warning(
+                                format!(
+                                    "World stop completed with a failure (exit code {:?}); it was marked Failed.",
+                                    exit.code
+                                ),
+                                session_warning,
+                            ))
+                        };
+                    }
+                    Ok(Some(StopOutcome::TimedOut(token))) => {
+                        view.active_operation = Some(LifecycleOperation::Stopping(world_id));
+                        view.pending_force_stop = Some((world_id, token));
+                        view.status_overrides
+                            .insert(world_id, WorldStatus::Stopping);
+                        view.lifecycle_error = Some(append_optional_warning(
+                            "Graceful stop timed out; the server is still running. Use Force Stop only if you accept possible data loss.".into(),
+                            session_warning,
+                        ));
+                    }
+                    Ok(None) => {
+                        view.active_operation = None;
+                        view.pending_force_stop = None;
+                        view.status_overrides.remove(&world_id);
+                        view.lifecycle_error = Some(append_optional_warning(
+                            "MineDock could not stop this world because no active lifecycle session was found.".into(),
+                            session_warning,
+                        ));
                     }
                     Err(error) => {
                         view.active_operation = None;
                         view.pending_force_stop = None;
                         view.status_overrides.remove(&world_id);
-                        view.lifecycle_error =
-                            Some(format!("Could not stop this world: {error}"));
+                        view.lifecycle_error = Some(append_optional_warning(
+                            format!("Could not stop this world: {error}"),
+                            session_warning,
+                        ));
+                    }
+                }
+                if let Some((world, session_warning)) = start_backup {
+                    if let Some(lifecycle) = lifecycle.take() {
+                        view.begin_automatic_backup(world_id, world, lifecycle, session_warning, cx);
+                    }
+                }
+                if let Some(lifecycle) = lifecycle {
+                    view._lifecycle = Some(lifecycle);
+                    if view.active_operation != Some(LifecycleOperation::BackingUp(world_id))
+                        && view.pending_force_stop.is_none()
+                    {
+                        view.active_operation = None;
+                        view.status_overrides.remove(&world_id);
                     }
                 }
                 if let Some(library) = view.library.as_mut() {
@@ -1796,6 +2332,201 @@ impl MineDockView {
                         view.lifecycle_error = Some(match view.lifecycle_error.take() {
                             Some(existing) => format!("{existing} {refresh_error}"),
                             None => refresh_error,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn begin_automatic_backup(
+        &mut self,
+        world_id: WorldId,
+        world: World,
+        lifecycle: AppLifecycle,
+        session_warning: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.backup_engine.clone() else {
+            self._lifecycle = Some(lifecycle);
+            self.active_operation = None;
+            self.status_overrides.remove(&world_id);
+            self.lifecycle_error = Some("The backup engine is unavailable.".into());
+            return;
+        };
+        self.active_operation = Some(LifecycleOperation::BackingUp(world_id));
+        self.status_overrides
+            .insert(world_id, WorldStatus::BackingUp);
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_automatic_backup(lifecycle, engine, world) });
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, result) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                view.active_operation = None;
+                view.status_overrides.remove(&world_id);
+                match result {
+                    Ok((record, records)) => {
+                        view.latest_backups.insert(world_id, record);
+                        view.backup_history.insert(world_id, records);
+                        view.backup_recovery_required.remove(&world_id);
+                        view.backup_error = None;
+                        view.lifecycle_error = session_warning.clone();
+                    }
+                    Err(error) => {
+                        view.backup_recovery_required.insert(world_id);
+                        view.backup_error = Some(format!("Automatic backup failed: {error}"));
+                        view.lifecycle_error = view.backup_error.clone().map(|message| {
+                            append_optional_warning(message, session_warning.clone())
+                        });
+                    }
+                }
+                if let Some(library) = view.library.as_mut() {
+                    if let Err(error) = library.reload() {
+                        view.lifecycle_error = Some(match view.lifecycle_error.take() {
+                            Some(existing) => {
+                                format!("{existing} Could not refresh world state: {error}")
+                            }
+                            None => format!("Could not refresh world state: {error}"),
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn retry_backup(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.backup_recovery_required.contains(&world_id) || self.active_operation.is_some() {
+            return;
+        }
+        let Some(mut world) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.get(world_id))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(engine) = self.backup_engine.clone() else {
+            self.backup_error = Some("The backup engine is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(lifecycle) = self._lifecycle.take() else {
+            self.backup_error = Some("The lifecycle runtime is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        // The process is already gone after an automatic backup failure. The
+        // backup engine receives a stopped source, while the persisted Failed
+        // state remains in force until the worker succeeds.
+        world.status = WorldStatus::Stopped;
+        self.active_operation = Some(LifecycleOperation::BackingUp(world_id));
+        self.status_overrides
+            .insert(world_id, WorldStatus::BackingUp);
+        self.backup_error = None;
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_recovery_backup(lifecycle, engine, world) });
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, result) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                view.active_operation = None;
+                view.status_overrides.remove(&world_id);
+                match result {
+                    Ok((record, records)) => {
+                        view.latest_backups.insert(world_id, record);
+                        view.backup_history.insert(world_id, records);
+                        view.backup_recovery_required.remove(&world_id);
+                        view.backup_error = None;
+                        view.lifecycle_error = None;
+                    }
+                    Err(error) => {
+                        view.backup_recovery_required.insert(world_id);
+                        view.backup_error = Some(format!("Backup retry failed: {error}"));
+                        view.lifecycle_error = view.backup_error.clone();
+                    }
+                }
+                if let Some(library) = view.library.as_mut() {
+                    if let Err(error) = library.reload() {
+                        view.lifecycle_error = Some(match view.lifecycle_error.take() {
+                            Some(existing) => {
+                                format!("{existing} Could not refresh world state: {error}")
+                            }
+                            None => format!("Could not refresh world state: {error}"),
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn continue_without_backup(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.backup_recovery_required.contains(&world_id) || self.active_operation.is_some() {
+            return;
+        }
+        let Some(engine) = self.backup_engine.clone() else {
+            self.backup_error = Some("The backup engine is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(lifecycle) = self._lifecycle.take() else {
+            self.backup_error = Some("The lifecycle runtime is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        self.active_operation = Some(LifecycleOperation::BackingUp(world_id));
+        self.status_overrides
+            .insert(world_id, WorldStatus::BackingUp);
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_continue_without_backup(lifecycle, engine, world_id) });
+        cx.spawn(async move |this, cx| {
+            let (lifecycle, result) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view._lifecycle = Some(lifecycle);
+                view.active_operation = None;
+                view.status_overrides.remove(&world_id);
+                match result {
+                    Ok(()) => {
+                        view.backup_recovery_required.remove(&world_id);
+                        view.backup_error = None;
+                        view.lifecycle_error = None;
+                    }
+                    Err(error) => {
+                        view.backup_recovery_required.insert(world_id);
+                        view.backup_error =
+                            Some(format!("Could not continue without a backup: {error}"));
+                        view.lifecycle_error = view.backup_error.clone();
+                    }
+                }
+                if let Some(library) = view.library.as_mut() {
+                    if let Err(error) = library.reload() {
+                        view.lifecycle_error = Some(match view.lifecycle_error.take() {
+                            Some(existing) => {
+                                format!("{existing} Could not refresh world state: {error}")
+                            }
+                            None => format!("Could not refresh world state: {error}"),
                         });
                     }
                 }
@@ -1828,21 +2559,32 @@ impl MineDockView {
         self.lifecycle_error = Some("Force stop is terminating the server process…".into());
         cx.notify();
 
-        let worker = cx
-            .background_executor()
-            .spawn(async move { execute_lifecycle_force_stop(lifecycle, world_id, token) });
+        let session_store = self.session_store.clone();
+        let worker = cx.background_executor().spawn(async move {
+            execute_lifecycle_force_stop_with_events(lifecycle, world_id, token, session_store)
+        });
         cx.spawn(async move |this, cx| {
             let (lifecycle, result) = worker.await;
             let _ = this.update(cx, |view, cx| {
                 view._lifecycle = Some(lifecycle);
-                match result {
+                let LifecycleForceStopEventResult {
+                    outcome,
+                    events,
+                    session_error,
+                } = result;
+                match outcome {
                     Ok(exit) => {
+                        view.record_server_events(world_id, events);
                         view.active_operation = None;
                         view.pending_force_stop = None;
                         view.status_overrides.remove(&world_id);
-                        view.lifecycle_error = Some(format!(
+                        let message = format!(
                             "The server was force-stopped and marked Failed (exit code {:?}).",
                             exit.code
+                        );
+                        view.lifecycle_error = Some(append_optional_warning(
+                            message,
+                            session_error.map(session_log_warning),
                         ));
                     }
                     Err(error) => {
@@ -1894,8 +2636,59 @@ impl MineDockView {
         {
             self.selected_world = Some(world_id);
             self.clipboard_notice = None;
+            self.load_persisted_world_state(world_id, cx);
             cx.notify();
         }
+    }
+
+    fn load_persisted_world_state(&mut self, world_id: WorldId, cx: &mut Context<Self>) {
+        let store = self.session_store.clone();
+        let engine = self.backup_engine.clone();
+        let worker = cx.background_executor().spawn(async move {
+            let session = match store {
+                Some(store) => store.latest_snapshot(world_id),
+                None => Ok(None),
+            };
+            let backup = match engine {
+                Some(engine) => engine.list(world_id),
+                None => Ok(Vec::new()),
+            };
+            (session, backup)
+        });
+        cx.spawn(async move |this, cx| {
+            let (session, backup) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                match session {
+                    Ok(Some(snapshot)) => {
+                        view.persisted_sessions.insert(world_id, snapshot);
+                    }
+                    Ok(None) => {
+                        view.persisted_sessions.remove(&world_id);
+                    }
+                    Err(error) => {
+                        view.backup_error = Some(format!(
+                            "Could not load the persisted session history: {error}"
+                        ));
+                    }
+                }
+                match backup {
+                    Ok(records) => {
+                        view.backup_history.insert(world_id, records.clone());
+                        if let Some(record) = records.into_iter().next() {
+                            view.latest_backups.insert(world_id, record);
+                        } else {
+                            view.latest_backups.remove(&world_id);
+                        }
+                    }
+                    Err(error) => {
+                        view.backup_error =
+                            Some(format!("Could not load the backup history: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn close_world_details(
@@ -1906,6 +2699,58 @@ impl MineDockView {
     ) {
         self.selected_world = None;
         cx.notify();
+    }
+
+    fn backup_now(
+        &mut self,
+        world_id: WorldId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(library) = self.library.as_ref() else {
+            return;
+        };
+        let Some(world) = library.get(world_id).cloned() else {
+            return;
+        };
+        if !self.can_mutate()
+            || self.active_operation.is_some()
+            || world.status != WorldStatus::Stopped
+        {
+            return;
+        }
+        let Some(engine) = self.backup_engine.clone() else {
+            self.backup_error = Some("The backup engine is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        self.active_operation = Some(LifecycleOperation::BackingUp(world_id));
+        self.status_overrides
+            .insert(world_id, WorldStatus::BackingUp);
+        self.backup_error = None;
+        let worker = cx
+            .background_executor()
+            .spawn(async move { execute_manual_backup(engine, world) });
+        cx.spawn(async move |this, cx| {
+            let result = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                view.active_operation = None;
+                view.status_overrides.remove(&world_id);
+                match result {
+                    Ok((record, records)) => {
+                        view.latest_backups.insert(world_id, record);
+                        view.backup_history.insert(world_id, records);
+                        view.backup_error = None;
+                    }
+                    Err(error) => {
+                        view.backup_error = Some(format!("Backup failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn set_language(
@@ -2175,6 +3020,12 @@ impl MineDockView {
                         language.text(UiText::LocalLibrary),
                         language.java_status(&self.java_status)
                     )))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x737985))
+                            .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                    )
                     .child(button(
                         language.text(UiText::JavaSettings),
                         if java_unavailable {
@@ -2184,6 +3035,12 @@ impl MineDockView {
                         },
                         self.can_mutate(),
                         cx.listener(Self::open_java_settings),
+                    ))
+                    .child(button(
+                        language.text(UiText::Diagnostics),
+                        rgb(0x303A50),
+                        self.can_mutate(),
+                        cx.listener(Self::export_diagnostics),
                     )),
             )
             .child(
@@ -2374,9 +3231,28 @@ impl MineDockView {
         };
         let language = self.language;
         let status = self.displayed_status(&world);
+        let current_lines = self.recent_logs.get(&world_id).cloned().unwrap_or_default();
+        let persisted_lines = self
+            .persisted_sessions
+            .get(&world_id)
+            .map(|snapshot| snapshot.logs.clone())
+            .unwrap_or_default();
         let mut log_items = div().flex().flex_col().gap(px(4.));
-        if let Some(lines) = self.recent_logs.get(&world_id) {
-            for line in lines {
+        for line in &current_lines {
+            let stream = match line.stream {
+                LogStream::Stdout => language.text(UiText::Stdout),
+                LogStream::Stderr => language.text(UiText::Stderr),
+            };
+            let truncated = if line.truncated { " …" } else { "" };
+            log_items = log_items.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(0xC7CEDB))
+                    .child(format!("[{stream}] {}{truncated}", line.line)),
+            );
+        }
+        if current_lines.is_empty() {
+            for line in &persisted_lines {
                 let stream = match line.stream {
                     LogStream::Stdout => language.text(UiText::Stdout),
                     LogStream::Stderr => language.text(UiText::Stderr),
@@ -2386,14 +3262,11 @@ impl MineDockView {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(0xC7CEDB))
-                        .child(format!("[{stream}] {}{truncated}", line.line)),
+                        .child(format!("[{stream}] {}{truncated}", line.text)),
                 );
             }
         }
-        let has_logs = self
-            .recent_logs
-            .get(&world_id)
-            .is_some_and(|lines| !lines.is_empty());
+        let has_logs = !current_lines.is_empty() || !persisted_lines.is_empty();
         if !has_logs {
             log_items = log_items.child(
                 div()
@@ -2401,6 +3274,76 @@ impl MineDockView {
                     .child(language.text(UiText::NoRecentLogs)),
             );
         }
+        let activity_text = match self.persisted_sessions.get(&world_id) {
+            Some(snapshot) => PlayerActivityTracker::from_snapshot(snapshot.activity.clone())
+                .map(|tracker| tracker.summary_at(Utc::now()))
+                .map(|summary| match summary.baseline {
+                    PresenceBaseline::Unknown => language.text(UiText::PlayersUnknown).into(),
+                    PresenceBaseline::Known => {
+                        let names = if summary.current_players.is_empty() {
+                            language.text(UiText::NoRecentLogs).to_owned()
+                        } else {
+                            summary.current_players.join(", ")
+                        };
+                        if language == Language::Japanese {
+                            format!(
+                                "{} / {}人が接続中 · {} · {} {}",
+                                summary.current_players.len(),
+                                world.server.max_players,
+                                names,
+                                language.text(UiText::Playtime),
+                                format_playtime(summary.total_playtime_seconds),
+                            )
+                        } else {
+                            format!(
+                                "{} / {} online · {} · {} {}",
+                                summary.current_players.len(),
+                                world.server.max_players,
+                                names,
+                                language.text(UiText::Playtime),
+                                format_playtime(summary.total_playtime_seconds),
+                            )
+                        }
+                    }
+                })
+                .unwrap_or_else(|| language.text(UiText::PlayersUnknown).into()),
+            None => language.text(UiText::PlayersUnknown).into(),
+        };
+        let backup_history = self
+            .backup_history
+            .get(&world_id)
+            .cloned()
+            .unwrap_or_default();
+        let backup_text = backup_history
+            .first()
+            .map(|record| format_backup_record(language, record))
+            .unwrap_or_else(|| language.text(UiText::NoBackups).into());
+        let backup_history_content = if backup_history.is_empty() {
+            div()
+                .text_color(rgb(0x7E8797))
+                .child(language.text(UiText::NoBackupHistory))
+        } else {
+            backup_history
+                .iter()
+                .fold(div().flex().flex_col().gap(px(4.)), |items, record| {
+                    items.child(
+                        div()
+                            .text_color(rgb(0xB7C0D0))
+                            .child(format_backup_record(language, record)),
+                    )
+                })
+        };
+        let backup_enabled = status == WorldStatus::Stopped
+            && self.active_operation.is_none()
+            && self.can_mutate()
+            && self.backup_engine.is_some();
+        let backup_recovery_required = self.backup_recovery_required.contains(&world_id);
+        let backup_recovery_action_enabled = backup_recovery_required
+            && status == WorldStatus::Failed
+            && self.active_operation.is_none()
+            && self.can_mutate()
+            && self.backup_engine.is_some()
+            && self._lifecycle.is_some();
         div()
             .absolute()
             .inset_0()
@@ -2477,6 +3420,27 @@ impl MineDockView {
                             )),
                     )
                     .child(detail_item(
+                        language.text(UiText::PlayerActivity),
+                        activity_text,
+                    ))
+                    .child(detail_item(language.text(UiText::LastBackup), backup_text))
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .text_color(rgb(0xE7EEFF))
+                            .child(language.text(UiText::BackupHistory)),
+                    )
+                    .child(
+                        div()
+                            .id("details-backup-history")
+                            .h(px(100.))
+                            .p(px(8.))
+                            .rounded(px(8.))
+                            .bg(rgb(0x171B24))
+                            .overflow_y_scroll()
+                            .child(backup_history_content),
+                    )
+                    .child(detail_item(
                         language.text(UiText::DataPath),
                         world.data_path.display().to_string(),
                     ))
@@ -2486,10 +3450,17 @@ impl MineDockView {
                     ))
                     .child(detail_item(
                         language.text(UiText::LastPlayed),
-                        world.last_played_at.map_or_else(
-                            || language.text(UiText::Never).to_owned(),
-                            |value| value.to_rfc3339(),
-                        ),
+                        world
+                            .last_played_at
+                            .or_else(|| {
+                                self.persisted_sessions
+                                    .get(&world_id)
+                                    .map(|snapshot| snapshot.record.started_at)
+                            })
+                            .map_or_else(
+                                || language.text(UiText::Never).to_owned(),
+                                |value| value.to_rfc3339(),
+                            ),
                     ))
                     .child(
                         div()
@@ -2497,6 +3468,40 @@ impl MineDockView {
                             .text_color(rgb(0xE7EEFF))
                             .child(language.text(UiText::RecentLogs)),
                     )
+                    .when_some(self.backup_error.clone(), |element, error| {
+                        element.child(div().text_color(rgb(0xFF9B9B)).child(error))
+                    })
+                    .when(backup_recovery_required, |element| {
+                        element.child(
+                            div()
+                                .flex()
+                                .gap(px(8.))
+                                .child(button(
+                                    language.text(UiText::RetryBackup),
+                                    rgb(0x3D5A88),
+                                    backup_recovery_action_enabled,
+                                    cx.listener(move |view, event, window, cx| {
+                                        view.retry_backup(world_id, event, window, cx)
+                                    }),
+                                ))
+                                .child(button(
+                                    language.text(UiText::ContinueWithoutBackup),
+                                    rgb(0x6D5B3B),
+                                    backup_recovery_action_enabled,
+                                    cx.listener(move |view, event, window, cx| {
+                                        view.continue_without_backup(world_id, event, window, cx)
+                                    }),
+                                )),
+                        )
+                    })
+                    .child(button(
+                        language.text(UiText::BackupNow),
+                        rgb(0x3D5A88),
+                        backup_enabled,
+                        cx.listener(move |view, event, window, cx| {
+                            view.backup_now(world_id, event, window, cx)
+                        }),
+                    ))
                     .child(
                         div()
                             .id("details-recent-logs")
@@ -2817,6 +3822,16 @@ impl Render for MineDockView {
                     .child(notice.clone()),
             );
         }
+        if let Some(notice) = &self.diagnostics_notice {
+            content = content.child(
+                div()
+                    .p(px(12.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x1D3A2A))
+                    .text_color(rgb(0xA7F3C0))
+                    .child(notice.clone()),
+            );
+        }
         if self.wizard_open {
             content = content.child(self.render_wizard(cx));
         }
@@ -3073,16 +4088,19 @@ mod tests {
     use super::{
         EULA_ACCEPTANCE_FILE, JavaPathInputError, LifecycleOperation, RecentLogLine,
         clear_recent_logs_for_new_session, eula_acceptance_path, eula_requires_confirmation,
+        execute_backup_with_recovery, execute_continue_without_backup,
         execute_lifecycle_force_stop, execute_lifecycle_poll, execute_lifecycle_poll_and_drain,
-        execute_lifecycle_start, execute_lifecycle_stop, parse_java_path_input, poll_exit_allowed,
-        select_java_runtime, start_allowed, stop_allowed, utf16_range_to_byte_range,
+        execute_lifecycle_start, execute_lifecycle_stop, execute_lifecycle_stop_with_events,
+        format_playtime, parse_java_path_input, poll_exit_allowed, select_java_runtime,
+        start_allowed, stop_allowed, utf16_range_to_byte_range,
     };
     use minedock_core::{
-        EulaAcceptanceRepository, FileEulaAcceptanceRepository, GracefulStopResult,
-        InMemoryLifecyclePersistence, JavaMajor, JavaReadiness, JavaRequirement,
-        JavaUnavailableReason, LaunchSpec, LifecycleLeaseProvider, ProcessExit, ProcessFactory,
-        ServerEvent, ServerProcess, SessionId, StopEscalationToken, ValidatedServerCommand,
-        WorldId, WorldStatus,
+        AppMetadata, CreateWorldRequest, EulaAcceptanceRepository, FileEulaAcceptanceRepository,
+        GracefulStopResult, InMemoryLifecyclePersistence, JavaMajor, JavaReadiness,
+        JavaRequirement, JavaUnavailableReason, JsonWorldRepository, LaunchSpec,
+        LifecycleLeaseProvider, ProcessExit, ProcessFactory, ServerEvent, ServerProcess, SessionId,
+        StopEscalationToken, TemplateCatalog, ValidatedServerCommand, WorldId, WorldRepository,
+        WorldStatus,
     };
     use std::cell::Cell;
     use std::collections::{HashMap, VecDeque};
@@ -3112,7 +4130,9 @@ mod tests {
         exits_on_poll: bool,
         poll_exit_success: bool,
         emit_final_events: bool,
+        emit_poll_events: bool,
         final_events_ready: Cell<bool>,
+        poll_events_emitted: Cell<bool>,
     }
 
     impl ServerProcess for TestProcess {
@@ -3183,7 +4203,15 @@ mod tests {
         }
 
         fn drain_events(&self, _: usize) -> Vec<ServerEvent> {
-            if self.emit_final_events && self.final_events_ready.replace(false) {
+            if self.emit_poll_events && !self.poll_events_emitted.replace(true) {
+                vec![ServerEvent::Raw(minedock_core::RawLogLine {
+                    world_id: self.world_id,
+                    session_id: self.session_id,
+                    stream: minedock_core::LogStream::Stdout,
+                    line: "[Server thread/INFO]: Alex joined the game".into(),
+                    truncated: false,
+                })]
+            } else if self.emit_final_events && self.final_events_ready.replace(false) {
                 vec![
                     ServerEvent::Raw(minedock_core::RawLogLine {
                         world_id: self.world_id,
@@ -3212,6 +4240,7 @@ mod tests {
         exits_on_poll: bool,
         poll_exit_success: bool,
         emit_final_events: bool,
+        emit_poll_events: bool,
     }
 
     impl ProcessFactory for TestProcessFactory {
@@ -3229,7 +4258,9 @@ mod tests {
                 exits_on_poll: self.exits_on_poll,
                 poll_exit_success: self.poll_exit_success,
                 emit_final_events: self.emit_final_events,
+                emit_poll_events: self.emit_poll_events,
                 final_events_ready: Cell::new(false),
+                poll_events_emitted: Cell::new(false),
             })
         }
     }
@@ -3260,6 +4291,13 @@ mod tests {
         assert_eq!(utf16_range_to_byte_range("abc", 90..120), 3..3);
         let reversed = std::ops::Range { start: 5, end: 2 };
         assert_eq!(utf16_range_to_byte_range("abcdef", reversed), 2..5);
+    }
+
+    #[test]
+    fn playtime_is_compact_and_stable() {
+        assert_eq!(format_playtime(0), "0m");
+        assert_eq!(format_playtime(3599), "59m");
+        assert_eq!(format_playtime(3660), "1h 1m");
     }
 
     #[test]
@@ -3367,6 +4405,50 @@ mod tests {
         assert!(!start_allowed(WorldStatus::Stopped, false, false, false));
         assert!(!start_allowed(WorldStatus::Stopped, true, true, false));
         assert!(!start_allowed(WorldStatus::Stopped, true, false, true));
+    }
+
+    #[test]
+    fn failed_automatic_backup_requires_an_explicit_recovery_choice() {
+        let root = TempDir::new().expect("temporary app data");
+        let repository = JsonWorldRepository::new(root.path());
+        let catalog = TemplateCatalog::built_in().expect("templates");
+        let world = CreateWorldRequest::new("Backup recovery", "creative")
+            .expect("request")
+            .build_world(&catalog)
+            .expect("world");
+        repository
+            .save(&AppMetadata::new(vec![world.clone()]))
+            .expect("metadata");
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            super::lifecycle_adapter::JsonLifecyclePersistence::new(repository.clone()),
+            super::native_process::NativeProcessFactory,
+            super::lifecycle_adapter::AppDataLeaseProvider::default(),
+        );
+        let engine = super::backup::SafeBackupEngine::new(root.path());
+
+        let (lifecycle, result) = execute_backup_with_recovery(
+            lifecycle,
+            engine.clone(),
+            world.clone(),
+            minedock_core::BackupReason::Shutdown,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(engine.recovery_required(world.id).expect("marker"));
+        assert_eq!(
+            repository.load().expect("failed metadata").worlds[0].status,
+            WorldStatus::Failed
+        );
+
+        let (lifecycle, continued) =
+            execute_continue_without_backup(lifecycle, engine.clone(), world.id);
+        assert!(continued.is_ok());
+        assert!(!engine.recovery_required(world.id).expect("cleared marker"));
+        assert_eq!(
+            repository.load().expect("continued metadata").worlds[0].status,
+            WorldStatus::Stopped
+        );
+        let _ = lifecycle;
     }
 
     #[test]
@@ -3484,6 +4566,42 @@ mod tests {
     }
 
     #[test]
+    fn session_log_failure_does_not_override_successful_backup_stop_boundary() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory {
+                emit_final_events: true,
+                ..TestProcessFactory::default()
+            },
+            TestLeaseProvider,
+        );
+        let (lifecycle, started) =
+            execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+                Ok(test_launch_spec(world_id))
+            });
+        assert!(started.is_ok());
+
+        // The lifecycle session is real, but the log store points at a
+        // different root, so finalization fails after core reaches BackingUp.
+        let unavailable_store =
+            super::session_store::SessionLogStore::new(root.path().join("missing-session-root"));
+        let (lifecycle, result) =
+            execute_lifecycle_stop_with_events(lifecycle, world_id, true, Some(unavailable_store));
+        assert!(matches!(
+            result.outcome,
+            Ok(Some(minedock_core::StopOutcome::Exited { exit })) if exit.success
+        ));
+        assert!(result.session_error.is_some());
+        assert_eq!(
+            lifecycle.persistence().status(world_id),
+            Some(WorldStatus::BackingUp)
+        );
+        assert!(lifecycle.session_id(world_id).is_none());
+    }
+
+    #[test]
     fn stop_timeout_keeps_session_for_explicit_force_escalation() {
         let root = TempDir::new().expect("temporary app data");
         let world_id = WorldId::new();
@@ -3494,6 +4612,7 @@ mod tests {
                 exits_on_poll: false,
                 poll_exit_success: false,
                 emit_final_events: false,
+                emit_poll_events: false,
             },
             TestLeaseProvider,
         );
@@ -3534,6 +4653,7 @@ mod tests {
                 exits_on_poll: true,
                 poll_exit_success: true,
                 emit_final_events: false,
+                emit_poll_events: false,
             },
             TestLeaseProvider,
         );
@@ -3577,6 +4697,7 @@ mod tests {
                 exits_on_poll: true,
                 poll_exit_success: false,
                 emit_final_events: false,
+                emit_poll_events: false,
             },
             TestLeaseProvider,
         );
@@ -3609,6 +4730,7 @@ mod tests {
                 exits_on_poll: true,
                 poll_exit_success: false,
                 emit_final_events: true,
+                emit_poll_events: false,
             },
             TestLeaseProvider,
         );
@@ -3618,10 +4740,13 @@ mod tests {
             });
         assert!(started.is_ok());
 
-        let (lifecycle, results) = execute_lifecycle_poll_and_drain(lifecycle, [world_id]);
+        let (lifecycle, results) =
+            execute_lifecycle_poll_and_drain(lifecycle, [world_id], None, None);
         let (_, result) = results.into_iter().next().expect("poll result");
-        let (exit, events) = result.expect("poll with events");
+        let (exit, events, snapshot, session_error) = result.expect("poll with events");
         assert!(matches!(exit, Some(ProcessExit { success: false, .. })));
+        assert!(snapshot.is_none());
+        assert!(session_error.is_none());
         assert!(events.iter().any(|event| matches!(
             event,
             ServerEvent::Raw(minedock_core::RawLogLine { line, .. })
@@ -3637,5 +4762,42 @@ mod tests {
             Some(WorldStatus::Failed)
         );
         assert!(lifecycle.session_id(world_id).is_none());
+    }
+
+    #[test]
+    fn running_poll_returns_the_updated_activity_projection() {
+        let root = TempDir::new().expect("temporary app data");
+        let world_id = WorldId::new();
+        let lifecycle = minedock_core::LifecycleSupervisor::new(
+            InMemoryLifecyclePersistence::default(),
+            TestProcessFactory {
+                stop_times_out: false,
+                exits_on_poll: false,
+                poll_exit_success: false,
+                emit_final_events: false,
+                emit_poll_events: true,
+            },
+            TestLeaseProvider,
+        );
+        let (lifecycle, started) =
+            execute_lifecycle_start(lifecycle, root.path(), world_id, || {
+                Ok(test_launch_spec(world_id))
+            });
+        let session_id = started.expect("start");
+        let store = super::session_store::SessionLogStore::new(root.path());
+        store
+            .begin_session(world_id, session_id, Some(42))
+            .expect("session record");
+
+        let (_, results) =
+            execute_lifecycle_poll_and_drain(lifecycle, [world_id], None, Some(store));
+        let (_, result) = results.into_iter().next().expect("poll result");
+        let (exit, events, snapshot, session_error) = result.expect("running poll");
+        assert!(exit.is_none());
+        assert!(!events.is_empty());
+        let snapshot = snapshot.expect("updated session projection");
+        assert_eq!(snapshot.activity.current_players, vec!["Alex"]);
+        assert_eq!(snapshot.activity.current_player_joined_at.len(), 1);
+        assert!(session_error.is_none());
     }
 }

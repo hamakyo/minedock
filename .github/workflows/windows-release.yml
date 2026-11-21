@@ -1,0 +1,26 @@
+name: Windows release package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and package
+        shell: pwsh
+        run: .\packaging\package-windows.ps1 -OutputDirectory .\dist
+      - name: Upload portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: minedock-windows-${{ github.ref_name }}
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256

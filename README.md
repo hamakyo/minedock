@@ -19,7 +19,9 @@ MineDock presents durable Worlds rather than server folders. A server process is
 
 ## Current status
 
-Phases 0–5 of the implementation plan provide the application shell and core/runtime foundations, with the initial Phase 6 Start/EULA/Stop wiring and Phase 9 LAN endpoint UX now connected:
+The MVP implementation now covers the core library, lifecycle, session history,
+player activity projection, safe local backups, diagnostics, and a portable
+Windows package. Native clean-machine acceptance remains a manual release gate:
 
 - a runnable GPUI 0.2.2 desktop application;
 - a dark World Library with a metadata-only create-world wizard;
@@ -31,10 +33,35 @@ Phases 0–5 of the implementation plan provide the application shell and core/r
 - a persisted explicit-EULA-acceptance gate, deterministic `server.properties`, and `online-mode=true` launch validation;
 - a shell-free native Java process adapter with graceful `stop`, bounded escalation, log events, per-world start reservations, and Windows Job Object containment.
 - a Windows LAN endpoint adapter that uses each world's configured `server-port`, shows multiple private IPv4 candidates conservatively, and provides per-address clipboard copy actions.
+- schema-versioned session records and append-only JSONL raw logs under each
+  world, with startup reconciliation for unfinished sessions;
+- best-effort Vanilla server-ready/join/leave/death parsing with persisted
+  player activity and playtime projections;
+- stopped-world verified ZIP backups with sidecar manifests containing the
+  Minecraft version, uncompressed/archive sizes, per-file and archive SHA-256
+  digests, atomic publication, retention, symlink/reparse-point checks, and
+  automatic backup after a successful graceful shutdown;
+- telemetry-free diagnostics with sanitized settings, validated session
+  metadata, bounded recent log tails, a contents summary, and owned
+  temporary-download cleanup;
+- a locked portable Windows ZIP workflow in
+  [packaging/package-windows.ps1](packaging/package-windows.ps1), with a
+  SHA-256 sidecar.
+- a Windows release workflow that uploads that ZIP as a GitHub Actions
+  artifact; it does not publish a GitHub Release. Installer and code-signing
+  work remain outside this portable-package scope.
 
-World cards now enable **Start** only for stopped, unreserved worlds and expose graceful **Stop** controls for running worlds. Start checks the persisted EULA acceptance, shows the explicit confirmation dialog when needed, then resolves the authoritative release, checks Java, provisions the world, and launches through the existing lifecycle/process adapter in the background. Running worlds show their configured LAN endpoint; when multiple private IPv4 candidates exist, MineDock labels the result as ambiguous instead of selecting one silently. Backups and logs/player UX remain open. Opening the app or creating a world still does not download a JAR or launch a server.
+World cards enable **Start** only for stopped, unreserved worlds and expose
+graceful **Stop** controls for running worlds. The detail view reloads the
+latest persisted session logs, player activity, and per-world backup history
+after an app restart. A successful graceful stop enters **Backing Up** when the
+world's policy enables shutdown backups; timeout, force-stop, and unexpected
+exit paths never claim a safe backup. Opening the app or creating a world still
+does not download a JAR or launch a server.
 
-The target MVP remains the end-to-end scenario in [docs/MVP.md](docs/MVP.md); checklist status is tracked in [PLAN.md](PLAN.md).
+The target MVP remains the end-to-end scenario in [docs/MVP.md](docs/MVP.md);
+checklist status is tracked in [PLAN.md](PLAN.md). Issue #19 remains open
+until the clean Windows 11 acceptance evidence is recorded.
 
 ## Run from source
 
@@ -70,6 +97,10 @@ cargo build -p minedock-app --locked
 
 Tests cover template validation, metadata round trips and corruption, world state transitions, Java output parsing, provider/EULA/provision invariants, lifecycle supervision, and controlled native-process behavior. Real Mojang downloads and a real Minecraft server process are intentionally outside the offline test suite.
 
+The native acceptance checklist is [docs/windows-acceptance.md](docs/windows-acceptance.md).
+It must be completed on a clean Windows 11 machine before calling the MVP
+release-ready.
+
 ## Repository layout
 
 ```text
@@ -93,6 +124,10 @@ MineDock/
 - Templates cannot provide executable paths, scripts, or download URLs.
 - Only allowlisted authoritative Mojang/Minecraft HTTPS authorities are accepted by the Vanilla provider.
 - Minecraft server JARs, worlds, Java runtimes, logs, backups, secrets, and local app data must not be committed.
+- Raw session logs are bounded and redact common credential-shaped values.
+- Backups are created only from an authoritative stopped world, publish through
+  a temporary directory and manifest verification, and exclude JARs, caches,
+  runtime leases, logs, temporary files, and previous backups.
 - The MVP does not require Docker, does not configure UPnP, and does not include mods, plugins, cloud features, or account login.
 
 Hardcore is a built-in template, not a special architectural mode.

@@ -167,6 +167,12 @@ impl WorldId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn parse(value: impl AsRef<str>) -> Result<Self> {
+        Uuid::parse_str(value.as_ref())
+            .map(Self)
+            .map_err(|error| MineDockError::Persistence(format!("invalid world id: {error}")))
+    }
 }
 
 impl Default for WorldId {

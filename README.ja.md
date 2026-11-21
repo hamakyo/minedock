@@ -19,7 +19,10 @@ MineDockは、Minecraftサーバーのフォルダではなく、長期的に保
 
 ## 現在の実装状況
 
-実装計画のPhase 0〜5までの基盤に加え、Phase 6のStart/EULA/StopフローとPhase 9のLAN接続先表示まで初期接続されている。
+MVPの実装として、ワールドライブラリ、ライフサイクル、セッション履歴、
+プレイヤー活動表示、安全なローカルバックアップ、診断情報、Windows向け
+ポータブルパッケージまで接続されている。クリーンなWindows実機受入だけは
+リリース前の手動ゲートとして残している。
 
 - GPUI 0.2.2で動作するデスクトップアプリケーション
 - メタデータのみのワールド作成ウィザードを備えたダークテーマのWorld Library
@@ -31,12 +34,16 @@ MineDockは、Minecraftサーバーのフォルダではなく、長期的に保
 - 明示的なEULA同意を永続化するゲート、決定論的な`server.properties`生成、`online-mode=true`の起動時検証
 - シェルを介さないネイティブJavaプロセスアダプター。gracefulな`stop`、上限付きエスカレーション、ログイベント、ワールド単位の起動予約、Windows Job Objectによるプロセス管理に対応
 - 各ワールドの設定済み`server-port`を使うWindows向けLAN接続先アダプター。複数のprivate IPv4候補は自動断定せず、候補ごとのコピー操作を提供
+- ワールドごとのスキーマ付きセッションレコードと追記型JSONL rawログ。起動時には未完了セッションを復旧
+- Vanillaのserver-ready/join/leave/deathログをベストエフォートで解析し、プレイヤー活動とプレイ時間を永続化
+- 停止済みワールドだけを対象に、Minecraftバージョン、非圧縮/アーカイブサイズ、ファイル単位とアーカイブ全体のSHA-256をsidecarマニフェストへ記録する検証済みZIPバックアップ。アトミック公開、保持数制御、symlink/reparse-point検査にも対応
+- 正常なgraceful Stop後の自動バックアップ。診断情報にはサニタイズ済み設定、検証済みセッションメタデータ、件数を制限した最近のログ末尾と内容要約を含め、所有済み一時ダウンロードを復旧
+- [packaging/package-windows.ps1](packaging/package-windows.ps1)による、SHA-256 sidecar付きのロックされたWindows ZIPパッケージ
+- Windows向けworkflowはこのZIPをGitHub Actions artifactとしてアップロードするが、GitHub Releaseは作成しない。installerとコード署名はportable packageとは別のpost-MVP範囲
 
-Worldカードでは、停止中かつ予約されていないワールドだけStartを有効化し、Running中のワールドではgracefulな**Stop**を操作できる。Startは永続化されたEULA同意を確認し、必要なら明示的な確認ダイアログを表示した後、公式リリース解決、Java確認、プロビジョニング、既存のライフサイクル/プロセスアダプターによる起動をバックグラウンドで行う。Running中は設定済みポートを使ったLAN接続先を表示し、private IPv4候補が複数ある場合は曖昧な状態として候補を断定しない。バックアップとログ/プレイヤー表示は未実装。アプリを開いたりワールドを作成したりするだけでは、JARのダウンロードやサーバー起動は行わない。
+Worldカードでは、停止中かつ予約されていないワールドだけStartを有効化し、Running中のワールドではgracefulな**Stop**を操作できる。詳細画面は再起動後も最新セッションログ、プレイヤー活動、ワールドごとのバックアップ履歴を読み戻す。バックアップポリシーが有効な場合、正常なgraceful Stop後だけ**Backing Up**へ進み、タイムアウト・強制停止・予期しない終了では安全なバックアップを主張しない。アプリを開いたりワールドを作成したりするだけでは、JARのダウンロードやサーバー起動は行わない。
 
-アプリを開いたりワールドを作成したりするだけでは、実際のMinecraft Server JARのダウンロードやサーバー起動は行わない。バックアップとログ/プレイヤー関連のUXは引き続き未実装。
-
-MVPの最終目標は[docs/MVP.md](docs/MVP.md)に記載しており、チェックリストの進捗は[PLAN.md](PLAN.md)で管理している。
+MVPの最終目標は[docs/MVP.md](docs/MVP.md)に記載しており、チェックリストの進捗は[PLAN.md](PLAN.md)で管理している。Issue #19はクリーンなWindows 11実機受入の証跡を記録するまで未完了とする。
 
 ## ソースから実行
 
@@ -74,6 +81,8 @@ cargo build -p minedock-app --locked
 
 実際のMojangからのダウンロードと、本物のMinecraftサーバープロセスの起動は、意図的にオフラインテストスイートの対象外としている。
 
+実機受入の手順は[docs/windows-acceptance.md](docs/windows-acceptance.md)に記載している。MVPをリリース可能とする前に、クリーンなWindows 11環境で完了させること。
+
 ## リポジトリ構成
 
 ```text
@@ -97,6 +106,8 @@ MineDock/
 - テンプレートから実行ファイルのパス、スクリプト、ダウンロードURLを指定することはできない。
 - Vanilla providerが受け入れるHTTPS接続先は、許可リストに含まれる公式Mojang/Minecraftのauthorityのみに限定する。
 - Minecraft Server JAR、ワールド、Javaランタイム、ログ、バックアップ、シークレット、ローカルアプリデータをコミットしてはならない。
+- セッションログはサイズ上限を持ち、一般的なcredential形式の値をマスクする。
+- バックアップは権威あるStopped状態からのみ作成し、一時ディレクトリとマニフェスト検証を経て公開する。JAR、キャッシュ、lease、ログ、一時ファイル、既存バックアップは含めない。
 - MVPではDockerを必須とせず、UPnP設定、Mod、Plugin、クラウド機能、アカウントログインも対象外とする。
 
 Hardcoreは特別なアーキテクチャモードではなく、組み込みテンプレートの1つとして扱う。

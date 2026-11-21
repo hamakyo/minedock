@@ -43,6 +43,8 @@ Future clients should be possible without rewriting world lifecycle logic:
 minedock-core/src/
 ├─ lib.rs
 ├─ domain.rs
+├─ activity.rs
+├─ backup.rs
 ├─ error.rs
 ├─ template.rs
 ├─ lifecycle.rs
@@ -52,7 +54,8 @@ minedock-core/src/
 │  ├─ properties.rs
 │  └─ provider.rs
 ├─ process.rs
-└─ runtime.rs
+├─ runtime.rs
+└─ session.rs
 
 minedock-app/src/
 ├─ main.rs
@@ -60,12 +63,15 @@ minedock-app/src/
 ├─ java_adapter.rs
 ├─ lifecycle_adapter.rs
 ├─ native_process.rs
-└─ native_safety.rs
+├─ native_safety.rs
+├─ session_store.rs
+├─ backup.rs
+└─ diagnostics.rs
 ```
 
 `minedock-core` owns domain validation, templates, persistence contracts, Java requirements, Vanilla metadata/provisioning rules, launch specifications, and lifecycle supervision. It imports neither GPUI nor Windows APIs.
 
-`minedock-app` owns the GPUI projection and all native effects: Windows app-data resolution and leasing, Java probing, HTTPS I/O, native process creation, reparse-point checks, and Job Object containment. Backup modules have not been introduced yet.
+`minedock-app` owns the GPUI projection and all native effects: Windows app-data resolution and leasing, Java probing, HTTPS I/O, native process creation, reparse-point checks, Job Object containment, session-file I/O, backup file copies, and diagnostics export. `minedock-core` owns the schema-versioned session/backup records and pure Vanilla activity parser; it does not perform compression or filesystem traversal.
 
 ## 4. World vs Server separation
 
@@ -153,7 +159,11 @@ stdout/stderr
     └──────────────▶ reliable process lifecycle events
 ```
 
-The app displays a bounded recent raw-log projection from the active session. Join/leave/death and server-ready parsing belongs to Phase 7 and is not implemented. Raw log text is never the authority for process exit or successful process control.
+The app persists the raw events delivered by this same stream to
+`worlds/<world-id>/logs/<session-id>/server.jsonl`. It also persists a session
+record and a replayable player-activity snapshot. Join/leave/death and
+server-ready parsing are best-effort projections only; raw log text is never
+the authority for process exit or successful process control.
 
 Lifecycle authority:
 - OS process handle / exit status
@@ -177,13 +187,15 @@ MineDockView (GPUI entity)
 ├─ Java settings and recovery state
 ├─ selected world detail panel
 ├─ bounded recent raw-log cache
+├─ latest persisted session/activity projection
+├─ backup status, history, and background operation state
 ├─ startup error / Java readiness projection
 └─ AppDataLease for this process lifetime
 ```
 
-At startup the app acquires an exclusive app-data lease, reconciles persisted active lifecycle states to `Failed`, loads the world library, and probes Java off the GPUI event loop. A lease or metadata failure disables mutating actions.
+At startup the app acquires an exclusive app-data lease, reconciles persisted active lifecycle states to `Failed`, marks unfinished session records interrupted, removes only owned download temporary files, loads the world library, and probes Java off the GPUI event loop. A lease or metadata failure disables mutating actions.
 
-The UI issues create-world commands and connects Start to explicit EULA acknowledgement, authoritative Vanilla resolution, provisioning, Java readiness, and the existing lifecycle/process adapters. Java recovery accepts an explicit executable path, persists it, and reruns discovery off the GPUI event loop. World details and a bounded recent raw-log view are presentation projections; persistent log files, player parsing, and backup commands remain later integration work.
+The UI issues create-world commands and connects Start to explicit EULA acknowledgement, authoritative Vanilla resolution, provisioning, Java readiness, and the existing lifecycle/process adapters. Java recovery accepts an explicit executable path, persists it, and reruns discovery off the GPUI event loop. Stop finalizes the session only after the adapter's final reader drain; a successful graceful stop may enter `BackingUp`, where the app-side engine copies the save and minimal server configuration off the event loop.
 
 ## 9. Persistence
 
@@ -208,6 +220,22 @@ Example:
 Use IDs rather than names as stable references.
 
 The app-data root is `%LOCALAPPDATA%\MineDock` on Windows, or the explicit `MINEDOCK_DATA_DIR` override. `minedock.json` stores metadata only; world content and server artifacts remain separate. Persisted world data paths are canonical relative paths rooted beneath app data.
+
+Session history is stored beneath
+`worlds/<world-id>/logs/<session-id>/`:
+
+- `session.json` is the schema-versioned lifecycle/session record;
+- `server.jsonl` is append-only bounded raw output;
+- `activity.json` is the replayable player projection.
+
+Backups are stored beneath `backups/<world-id>/` as
+`<backup-id>.zip` plus `<backup-id>.manifest.json` and a world-scoped
+`index.json`. The schema-versioned manifest records the Minecraft version,
+uncompressed/archive sizes, per-file SHA-256 values, and the completed archive
+SHA-256. The artifact selection excludes JARs, caches, runtime leases, logs,
+temporary files, and previous backups. Startup reconciliation reads only
+manifest and ZIP central-directory structure; full content verification is a
+background-worker operation used by normal backup listing.
 
 ## 10. Error model
 
